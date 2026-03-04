@@ -1,0 +1,182 @@
+---
+title: Introduction
+description: Async Rust wrapper for ffmpeg and ffprobe with tokio, tracing, and graceful shutdown support
+---
+
+# libffmpeg
+
+**libffmpeg** is an async-first Rust library that provides a high-level interface to ffmpeg and ffprobe. Built on tokio with comprehensive tracing integration, it offers three execution modes, structured progress parsing, and graceful shutdown capabilities.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Three Execution Modes" icon="gears">
+    Choose from slim (no monitoring), standard (with monitoring), or graceful (stdin-based quit with SIGKILL fallback) depending on your needs
+  </Card>
+  
+  <Card title="ffprobe Support" icon="magnifying-glass">
+    Run ffprobe commands and extract media metadata like duration with simple, type-safe APIs
+  </Card>
+  
+  <Card title="Async & Cancellable" icon="rotate">
+    Built on tokio with CancellationToken support for clean cancellation of long-running operations
+  </Card>
+  
+  <Card title="Progress Parsing" icon="chart-line">
+    Structured Progress type automatically parsed from ffmpeg's `-progress pipe:1` output
+  </Card>
+  
+  <Card title="Tracing Integration" icon="bug">
+    All functions instrumented with tracing spans and valuable support for comprehensive observability
+  </Card>
+  
+  <Card title="Binary Discovery" icon="search">
+    Automatic binary discovery via libwhich with environment variable overrides for custom paths
+  </Card>
+</CardGroup>
+
+## Three Execution Modes Explained
+
+libffmpeg provides three distinct ways to execute ffmpeg, each optimized for different use cases:
+
+### `ffmpeg_slim` — No Monitoring
+
+The lightest-weight variant. Spawns ffmpeg, waits for completion, and returns the exit result. Perfect when you don't need real-time output.
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg_slim;
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let result = ffmpeg_slim(token, |cmd| {
+    cmd.arg("-i").arg("input.mp4")
+       .arg("-c:v").arg("libx264")
+       .arg("output.mp4");
+}).await?;
+```
+
+### `ffmpeg` — With Monitoring
+
+Streams stdout/stderr through a `CommandMonitorServer` for real-time progress parsing or logging. Killed immediately on cancellation.
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg;
+use libffmpeg::libcmd::CommandMonitor;
+use tokio_util::sync::CancellationToken;
+
+let monitor = CommandMonitor::with_capacity(100);
+let token = CancellationToken::new();
+
+let result = ffmpeg(token, &monitor.server, |cmd| {
+    cmd.arg("-i").arg("input.mp4")
+       .arg("-progress").arg("pipe:1")
+       .arg("-y")
+       .arg("output.mp4");
+}).await?;
+```
+
+### `ffmpeg_graceful` — Graceful Shutdown
+
+Like standard `ffmpeg`, but on cancellation it sends `q` to stdin first, giving ffmpeg up to 5 seconds to exit cleanly before falling back to SIGKILL. This allows ffmpeg to finalize output files properly.
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg_graceful;
+use libffmpeg::libcmd::CommandMonitor;
+use tokio_util::sync::CancellationToken;
+
+let monitor = CommandMonitor::with_capacity(100);
+let token = CancellationToken::new();
+
+let result = ffmpeg_graceful(token, &monitor.client, &monitor.server, |cmd| {
+    cmd.arg("-i").arg("input.mp4")
+       .arg("-c:v").arg("libx264")
+       .arg("output.mp4");
+}).await?;
+```
+
+## Binary Discovery
+
+Both `ffmpeg` and `ffprobe` binaries are located automatically using the following lookup order:
+
+1. **Environment variable** — Check `LIBFFMPEG_FFMPEG_PATH` or `LIBFFMPEG_FFPROBE_PATH` and validate it's executable
+2. **PATH search** — Fall back to searching `$PATH` via libwhich
+
+```bash
+export LIBFFMPEG_FFMPEG_PATH=/opt/homebrew/bin/ffmpeg
+export LIBFFMPEG_FFPROBE_PATH=/opt/homebrew/bin/ffprobe
+```
+
+<Note>
+  If neither environment variable is set nor binary found in PATH, functions will return a `NotFound` error.
+</Note>
+
+## Core APIs
+
+### ffmpeg Module
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ffmpeg_slim` | `(CancellationToken, Prepare) -> Result<CommandExit, FfmpegError>` | Run ffmpeg with cancellation only |
+| `ffmpeg` | `(CancellationToken, &CommandMonitorServer, Prepare) -> Result<CommandExit, FfmpegError>` | Run ffmpeg with output monitoring |
+| `ffmpeg_graceful` | `(CancellationToken, &CommandMonitorClient, &CommandMonitorServer, Prepare) -> Result<CommandExit, FfmpegError>` | Run ffmpeg with graceful shutdown |
+
+### ffprobe Module
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ffprobe` | `(CancellationToken, Prepare) -> Result<CommandExit, FfprobeError>` | Run ffprobe with cancellation |
+
+### util Module
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `get_duration` | `(impl AsRef<Path>, CancellationToken) -> Result<Duration, DurationError>` | Extract media duration via ffprobe |
+
+## Progress Parsing
+
+When using ffmpeg with `-progress pipe:1`, the library can parse structured progress updates:
+
+```rust
+use libffmpeg::ffmpeg::progress::PartialProgress;
+
+let mut progress = PartialProgress::default();
+// Feed lines from ffmpeg's stdout
+if progress.with_line("frame=100") {
+    if let Some(update) = progress.finish() {
+        println!("Frame: {}, FPS: {}, Speed: {}x", 
+                 update.frame, update.fps, update.speed);
+    }
+}
+```
+
+The `Progress` struct includes:
+- `frame: usize` — Number of frames processed
+- `fps: f64` — Current encoding speed (frames per second)
+- `bitrate: isize` — Current bitrate in bytes per second
+- `total_size: usize` — Total output size in bytes
+- `out_time: Duration` — Elapsed output time
+- `speed: f64` — Encoding speed multiplier (e.g., 2.0 = 2x realtime)
+- `progress: ProgressState` — Continue, End, or Unknown
+
+## Dependencies
+
+This crate uses several companion libraries:
+
+- **libcmd** — Async command execution with monitoring and cancellation
+- **libwhich** — Binary discovery with PATH searching
+- **liberror** — Error handling utilities
+- **libsignal** — Signal handling (used in examples)
+
+All functions are instrumented with tracing and support the `valuable` crate for structured logging.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Add libffmpeg to your project and configure tracing support
+  </Card>
+  
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Follow a step-by-step guide to your first transcode with progress monitoring
+  </Card>
+</CardGroup>

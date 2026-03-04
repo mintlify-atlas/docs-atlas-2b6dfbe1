@@ -1,0 +1,192 @@
+---
+title: 'Progress Types'
+description: 'Types for tracking ffmpeg encoding progress'
+---
+
+## Progress
+
+A parsed progress snapshot from ffmpeg's `-progress pipe:1` output.
+
+This struct contains real-time information about the encoding process, including frame count, encoding speed, bitrate, and overall progress state.
+
+<ResponseField name="frame" type="usize">
+  Number of frames processed so far.
+</ResponseField>
+
+<ResponseField name="fps" type="f64">
+  Current encoding speed in frames per second.
+</ResponseField>
+
+<ResponseField name="bitrate" type="isize">
+  Current bitrate in bytes per second.
+</ResponseField>
+
+<ResponseField name="total_size" type="usize">
+  Total output size in bytes.
+</ResponseField>
+
+<ResponseField name="out_time" type="Duration">
+  Elapsed output time (position in the output stream).
+</ResponseField>
+
+<ResponseField name="dup_frames" type="usize">
+  Number of duplicated frames.
+</ResponseField>
+
+<ResponseField name="drop_frames" type="usize">
+  Number of dropped frames.
+</ResponseField>
+
+<ResponseField name="speed" type="f64">
+  Encoding speed as a multiplier of realtime (e.g. 2.0 = 2x realtime).
+</ResponseField>
+
+<ResponseField name="progress" type="ProgressState">
+  Whether ffmpeg is still processing or has finished.
+</ResponseField>
+
+### Example
+
+```rust
+use libffmpeg::ffmpeg::progress::Progress;
+
+// Progress is typically obtained from PartialProgress
+// See PartialProgress example for usage
+```
+
+## PartialProgress
+
+Accumulator for parsing ffmpeg's `-progress pipe:1` output line by line.
+
+Feed lines via `with_line()`, then call `finish()` once a complete progress block has been received to produce a `Progress` snapshot.
+
+<ResponseField name="frame" type="usize" default="0">
+  Accumulated frame count.
+</ResponseField>
+
+<ResponseField name="fps" type="f64" default="0.0">
+  Accumulated frames per second value.
+</ResponseField>
+
+<ResponseField name="bitrate" type="String" default='""'>
+  Accumulated bitrate string (e.g., "1234kbits/s").
+</ResponseField>
+
+<ResponseField name="total_size" type="usize" default="0">
+  Accumulated total output size.
+</ResponseField>
+
+<ResponseField name="out_time_us" type="u128" default="0">
+  Accumulated output time in microseconds.
+</ResponseField>
+
+<ResponseField name="dup_frames" type="usize" default="0">
+  Accumulated duplicated frame count.
+</ResponseField>
+
+<ResponseField name="drop_frames" type="usize" default="0">
+  Accumulated dropped frame count.
+</ResponseField>
+
+<ResponseField name="speed" type="String" default='""'>
+  Accumulated speed string (e.g., "2.5x").
+</ResponseField>
+
+<ResponseField name="progress" type="PartialProgressState" default="Unset">
+  Current progress state.
+</ResponseField>
+
+### Methods
+
+#### with_line
+
+```rust
+pub fn with_line(&mut self, line: &str) -> bool
+```
+
+Feed a single `key=value` line from ffmpeg's progress output.
+
+Returns `true` if the line was recognized (or intentionally ignored), `false` if the key was completely unknown.
+
+#### finish
+
+```rust
+pub fn finish(&self) -> Option<Progress>
+```
+
+Attempt to produce a complete `Progress` snapshot from the accumulated state.
+
+Returns `None` if no `progress=` line has been received yet, or if the bitrate value could not be parsed.
+
+### Example
+
+```rust
+use libffmpeg::ffmpeg::progress::PartialProgress;
+
+let mut partial = PartialProgress::default();
+partial.with_line("frame=120");
+partial.with_line("fps=30.00");
+partial.with_line("progress=continue");
+
+if let Some(progress) = partial.finish() {
+    println!("frame={} fps={}", progress.frame, progress.fps);
+}
+```
+
+## ProgressState
+
+The state reported in ffmpeg's `progress=` line.
+
+### Variants
+
+<ResponseField name="Continue" type="variant">
+  ffmpeg is continuing to process the input. More progress updates are expected.
+</ResponseField>
+
+<ResponseField name="End" type="variant">
+  ffmpeg has finished processing. This is the final progress update.
+</ResponseField>
+
+<ResponseField name="Unknown" type="variant">
+  An unrecognized progress state was reported.
+  
+  **Fields:**
+  - `String` - The raw, unrecognized state value
+</ResponseField>
+
+### Example
+
+```rust
+use libffmpeg::ffmpeg::progress::ProgressState;
+
+match progress.progress {
+    ProgressState::Continue => println!("Still encoding..."),
+    ProgressState::End => println!("Encoding complete!"),
+    ProgressState::Unknown(ref s) => println!("Unknown state: {}", s),
+}
+```
+
+## PartialProgressState
+
+Internal state tracking for `PartialProgress` accumulation.
+
+### Variants
+
+<ResponseField name="Continue" type="variant">
+  Progress state is set to "continue".
+</ResponseField>
+
+<ResponseField name="End" type="variant">
+  Progress state is set to "end".
+</ResponseField>
+
+<ResponseField name="Unknown" type="variant">
+  An unrecognized progress state value was encountered.
+  
+  **Fields:**
+  - `String` - The raw, unrecognized state value
+</ResponseField>
+
+<ResponseField name="Unset" type="variant">
+  No progress state has been set yet (initial state).
+</ResponseField>

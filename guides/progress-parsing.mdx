@@ -1,0 +1,463 @@
+---
+title: "Parsing FFmpeg Progress"
+description: "Learn how to parse FFmpeg progress output using PartialProgress for real-time feedback"
+---
+
+## Overview
+
+The `PartialProgress` struct accumulates FFmpeg's `-progress pipe:1` output line by line and produces structured `Progress` snapshots. This enables real-time progress tracking, percentage calculation, and user feedback during encoding operations.
+
+## When to Use PartialProgress
+
+Use `PartialProgress` when you need to:
+
+- Display real-time encoding progress to users
+- Calculate completion percentage
+- Monitor encoding speed and performance
+- Track frame count, bitrate, and other metrics
+- Implement progress bars or status updates
+
+This is typically used in combination with [`ffmpeg`](/guides/ffmpeg-standard) or [`ffmpeg_graceful`](/guides/ffmpeg-graceful) for output monitoring.
+
+## Progress Output Format
+
+FFmpeg's `-progress pipe:1` outputs key-value pairs like:
+
+```
+frame=120
+fps=30.00
+bitrate=1024.5kbits/s
+total_size=524288
+out_time_us=4000000
+dup_frames=0
+drop_frames=0
+speed=1.2x
+progress=continue
+```
+
+Each block ends with a `progress=` line indicating the block is complete.
+
+## Basic Usage
+
+<Steps>
+  <Step title="Create a PartialProgress instance">
+    Initialize the accumulator:
+
+    ```rust
+    use libffmpeg::ffmpeg::progress::PartialProgress;
+
+    let mut partial = PartialProgress::default();
+    ```
+  </Step>
+
+  <Step title="Feed lines from FFmpeg">
+    Pass each stdout line to `with_line`:
+
+    ```rust
+    partial.with_line("frame=120");
+    partial.with_line("fps=30.00");
+    partial.with_line("bitrate=1024.5kbits/s");
+    partial.with_line("progress=continue");
+    ```
+  </Step>
+
+  <Step title="Check for completion">
+    After each line, call `finish` to see if a complete progress block is ready:
+
+    ```rust
+    if let Some(progress) = partial.finish() {
+        println!("Frame: {}, FPS: {:.1}", progress.frame, progress.fps);
+    }
+    ```
+  </Step>
+</Steps>
+
+## Complete Example with FFmpeg Monitoring
+
+This example is adapted from `libffmpeg/examples/transcode_with_progress.rs:36-74`:
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg;
+use libffmpeg::ffmpeg::progress::PartialProgress;
+use libffmpeg::libcmd::{CommandMonitor, CommandMonitorMessage};
+use tokio_util::sync::CancellationToken;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let input = "input.mp4";
+    let output = "output.mp4";
+    
+    // Get video duration for percentage calculation
+    let cancellation_token = CancellationToken::new();
+    let video_duration = libffmpeg::util::get_duration(
+        input,
+        cancellation_token.child_token()
+    ).await?;
+    let total_seconds = video_duration.as_secs() as f64;
+    
+    // Create monitor
+    let monitor = CommandMonitor::with_capacity(100);
+    
+    // Spawn monitoring task
+    let monitor_task = {
+        let mut client = monitor.client.clone();
+        tokio::spawn(async move {
+            let mut progress = PartialProgress::default();
+            
+            while let Some(Some(message)) = client.recv().await {
+                match message {
+                    CommandMonitorMessage::Stdout { line } => {
+                        // Try to parse as progress line
+                        if !progress.with_line(&line) {
+                            // Not a progress line, print it
+                            println!("[OUT] {}", line);
+                            continue;
+                        }
+                        
+                        // Check if progress block is complete
+                        if let Some(update) = progress.finish() {
+                            let percent = 100.0 * update.out_time.as_secs_f64() / total_seconds;
+                            let elapsed = humantime::format_duration(update.out_time);
+                            let total = humantime::format_duration(Duration::from_secs_f64(total_seconds));
+                            
+                            println!(
+                                "Progress: {:.2}% ({} / {}) | Frame: {} | Bitrate: {} | FPS: {:.1} | Speed: {:.1}x",
+                                percent,
+                                elapsed,
+                                total,
+                                update.frame,
+                                format_bitrate(update.bitrate),
+                                update.fps,
+                                update.speed
+                            );
+                        }
+                    }
+                    CommandMonitorMessage::Stderr { line } => {
+                        eprintln!("[ERR] {}", line);
+                    }
+                }
+            }
+        })
+    };
+    
+    // Run FFmpeg with progress output
+    let result = ffmpeg(cancellation_token.child_token(), &monitor.server, |cmd| {
+        cmd.arg("-i").arg(input);
+        cmd.arg("-c:v").arg("libx264");
+        cmd.arg("-preset").arg("fast");
+        cmd.arg("-progress").arg("pipe:1"); // IMPORTANT: Send progress to stdout
+        cmd.arg("-y");
+        cmd.arg(output);
+    }).await?;
+    
+    monitor_task.await?;
+    
+    Ok(())
+}
+
+fn format_bitrate(bitrate: isize) -> String {
+    if bitrate < 1024 {
+        format!("{}bps", bitrate)
+    } else if bitrate < 1024 * 1024 {
+        format!("{:.1}Kbps", bitrate as f64 / 1024.0)
+    } else {
+        format!("{:.1}Mbps", bitrate as f64 / (1024.0 * 1024.0))
+    }
+}
+```
+
+<Tip>
+  Always use `-progress pipe:1` in your FFmpeg command to send structured progress output to stdout. Without this flag, you won't receive parseable progress information.
+</Tip>
+
+## Progress Struct Fields
+
+The `Progress` struct contains the following fields (from `libffmpeg/src/ffmpeg/progress.rs:152-174`):
+
+```rust
+pub struct Progress {
+    /// Number of frames processed so far.
+    pub frame: usize,
+    
+    /// Current encoding speed in frames per second.
+    pub fps: f64,
+    
+    /// Current bitrate in bytes per second.
+    pub bitrate: isize,
+    
+    /// Total output size in bytes.
+    pub total_size: usize,
+    
+    /// Elapsed output time (position in the output stream).
+    pub out_time: Duration,
+    
+    /// Number of duplicated frames.
+    pub dup_frames: usize,
+    
+    /// Number of dropped frames.
+    pub drop_frames: usize,
+    
+    /// Encoding speed as a multiplier of realtime (e.g. 2.0 = 2x realtime).
+    pub speed: f64,
+    
+    /// Whether ffmpeg is still processing or has finished.
+    pub progress: ProgressState,
+}
+```
+
+### ProgressState Enum
+
+```rust
+pub enum ProgressState {
+    Continue,  // Encoding is ongoing
+    End,       // Encoding completed
+    Unknown(String),  // Unrecognized state
+}
+```
+
+## Calculating Percentage
+
+To display completion percentage, you need the total video duration:
+
+```rust
+use libffmpeg::util::get_duration;
+
+// Get total duration
+let total_duration = get_duration(input, cancellation_token.child_token()).await?;
+let total_seconds = total_duration.as_secs_f64();
+
+// In your monitoring loop
+if let Some(progress) = partial.finish() {
+    let elapsed_seconds = progress.out_time.as_secs_f64();
+    let percentage = (elapsed_seconds / total_seconds) * 100.0;
+    
+    println!("Progress: {:.2}%", percentage);
+}
+```
+
+## Handling Unrecognized Lines
+
+The `with_line` method returns `bool` indicating whether the line was recognized:
+
+```rust
+if !progress.with_line(&line) {
+    // Line was not a recognized progress key
+    println!("Unrecognized line: {}", line);
+}
+```
+
+Unrecognized lines might be:
+- FFmpeg informational messages
+- Warning messages
+- Custom output from filters
+
+## Implementation Details
+
+From `libffmpeg/src/ffmpeg/progress.rs:54-105`, the `with_line` method parses key-value pairs:
+
+```rust
+pub fn with_line(&mut self, line: &str) -> bool {
+    let mut parts = line.splitn(2, '=');
+    let Some(key) = parts.next() else {
+        return false;
+    };
+    let Some(value) = parts.next() else {
+        return false;
+    };
+
+    // Invalid value
+    if value == "N/A" {
+        return true;
+    }
+
+    match key {
+        "bitrate" => self.bitrate = value.trim().to_string(),
+        "speed" => self.speed = value.trim().to_string(),
+        "frame" => parse_value!(as usize => frame),
+        "fps" => parse_value!(as f64 => fps),
+        "total_size" => parse_value!(as usize => total_size),
+        "out_time_us" => parse_value!(as u128 => out_time_us),
+        "dup_frames" => parse_value!(as usize => dup_frames),
+        "drop_frames" => parse_value!(as usize => drop_frames),
+        "progress" => {
+            self.progress = match value.trim() {
+                "continue" => PartialProgressState::Continue,
+                "end" => PartialProgressState::End,
+                v => PartialProgressState::Unknown(v.to_string()),
+            };
+        }
+        
+        // Explicitly ignored keys
+        key if key.starts_with("stream_") => return true,
+        "out_time" | "out_time_ms" => return true,
+        _ => return false,
+    }
+    true
+}
+```
+
+### Finish Method
+
+From `libffmpeg/src/ffmpeg/progress.rs:107-134`, the `finish` method converts the accumulated state:
+
+```rust
+pub fn finish(&self) -> Option<Progress> {
+    let progress = match &self.progress {
+        PartialProgressState::Unset => return None,
+        PartialProgressState::Continue => ProgressState::Continue,
+        PartialProgressState::End => ProgressState::End,
+        PartialProgressState::Unknown(v) => ProgressState::Unknown(v.clone()),
+    };
+
+    // Parse bitrate from "1024.5kbits/s" format
+    let num_part = self.bitrate.split("kbits").next().unwrap_or("0");
+    let kbitsf = num_part.parse::<f32>().ok()?;
+    let bitrate = (kbitsf * 1024.0) as isize;
+    
+    Some(Progress {
+        frame: self.frame,
+        fps: self.fps,
+        bitrate,
+        total_size: self.total_size,
+        out_time: Duration::from_micros(self.out_time_us as u64),
+        dup_frames: self.dup_frames,
+        drop_frames: self.drop_frames,
+        speed: self.speed.trim_end_matches('x').parse().unwrap_or_default(),
+        progress,
+    })
+}
+```
+
+<Note>
+  `finish()` returns `None` if no `progress=` line has been received yet, or if the bitrate cannot be parsed. Always check for `Some` before using the result.
+</Note>
+
+## Advanced Examples
+
+### Progress Bar with Indicatif
+
+```rust
+use indicatif::{ProgressBar, ProgressStyle};
+
+let pb = ProgressBar::new(video_duration.as_secs());
+pb.set_style(
+    ProgressStyle::default_bar()
+        .template("{spinner:.green} [{bar:40.cyan/blue}] {percent}% {msg}")
+        .unwrap()
+);
+
+let monitor_task = tokio::spawn(async move {
+    let mut progress = PartialProgress::default();
+    
+    while let Some(Some(msg)) = client.recv().await {
+        if let CommandMonitorMessage::Stdout { line } = msg {
+            if progress.with_line(&line) {
+                if let Some(update) = progress.finish() {
+                    pb.set_position(update.out_time.as_secs());
+                    pb.set_message(format!(
+                        "FPS: {:.1} | Speed: {:.1}x",
+                        update.fps,
+                        update.speed
+                    ));
+                }
+            }
+        }
+    }
+    
+    pb.finish_with_message("Complete");
+});
+```
+
+### Detecting Encoding Issues
+
+```rust
+if let Some(progress) = partial.finish() {
+    // Check for performance issues
+    if progress.speed < 0.5 {
+        eprintln!("Warning: Encoding slower than realtime ({:.2}x)", progress.speed);
+    }
+    
+    // Check for dropped frames
+    if progress.drop_frames > 0 {
+        eprintln!("Warning: {} frames dropped", progress.drop_frames);
+    }
+    
+    // Check for duplicated frames
+    if progress.dup_frames > 0 {
+        eprintln!("Warning: {} frames duplicated", progress.dup_frames);
+    }
+    
+    // Detect completion
+    if matches!(progress.progress, ProgressState::End) {
+        println!("Encoding finished!");
+    }
+}
+```
+
+### Estimated Time Remaining
+
+```rust
+use std::time::Instant;
+
+let start_time = Instant::now();
+let total_duration = video_duration.as_secs_f64();
+
+if let Some(progress) = partial.finish() {
+    let elapsed_secs = start_time.elapsed().as_secs_f64();
+    let progress_secs = progress.out_time.as_secs_f64();
+    
+    if progress_secs > 0.0 {
+        let rate = progress_secs / elapsed_secs; // How much video per second
+        let remaining_video = total_duration - progress_secs;
+        let eta_seconds = remaining_video / rate;
+        
+        println!("ETA: {:.0} seconds", eta_seconds);
+    }
+}
+```
+
+## Ignored Fields
+
+Some FFmpeg progress fields are intentionally ignored:
+
+- `stream_*` - Per-stream metrics (not included in Progress)
+- `out_time` - Human-readable time (we use `out_time_us` for precision)
+- `out_time_ms` - Millisecond time (we use microseconds)
+
+These fields still return `true` from `with_line`, they just don't update the state.
+
+## Serialization
+
+Both `Progress` and `ProgressState` implement `Serialize` and `Deserialize`:
+
+```rust
+use serde_json;
+
+if let Some(progress) = partial.finish() {
+    let json = serde_json::to_string(&progress)?;
+    println!("Progress JSON: {}", json);
+}
+```
+
+This is useful for:
+- Sending progress over network APIs
+- Storing progress snapshots
+- Logging to structured log systems
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="FFmpeg with Monitoring" icon="tv" href="/guides/ffmpeg-standard">
+    Use ffmpeg function to capture progress output
+  </Card>
+  <Card title="Graceful Shutdown" icon="circle-stop" href="/guides/ffmpeg-graceful">
+    Combine progress with graceful cancellation
+  </Card>
+  <Card title="Duration Extraction" icon="clock" href="/guides/duration-extraction">
+    Get video duration for percentage calculation
+  </Card>
+  <Card title="API Reference" icon="book" href="/api/progress">
+    Complete Progress API documentation
+  </Card>
+</CardGroup>

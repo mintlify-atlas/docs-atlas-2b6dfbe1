@@ -1,97 +1,201 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "libffmpeg"
+mode: "custom"
 ---
 
-## Setting up
+<div className="relative bg-gradient-to-br from-[#0f1117] via-[#1a1d27] to-[#0f1117] dark:bg-gradient-to-br dark:from-[#0f1117] dark:via-[#1a1d27] dark:to-[#0f1117] py-20 overflow-hidden">
+  <div className="max-w-6xl mx-auto px-6">
+    <div className="grid lg:grid-cols-12 gap-12 items-center">
+      <div className="lg:col-span-7">
+        <h1 className="text-5xl lg:text-6xl font-bold text-gray-100 dark:text-gray-100 mb-6">
+          Async Rust wrapper for ffmpeg
+        </h1>
+        <p className="text-xl text-gray-400 dark:text-gray-400 max-w-2xl mb-8">
+          Built on tokio with tracing, graceful shutdown, and progress parsing. Three execution modes, full cancellation support, and automatic binary discovery.
+        </p>
+        <div className="flex flex-wrap gap-4">
+          <a
+            href="/quickstart"
+            className="inline-flex items-center px-6 py-3 rounded-lg bg-[#00D26A] text-white font-semibold hover:bg-[#00A054] transition-colors"
+          >
+            Get Started
+          </a>
+          <a
+            href="/api/ffmpeg"
+            className="inline-flex items-center px-6 py-3 rounded-lg border border-white/30 bg-white/10 text-white font-semibold hover:bg-white/20 transition-colors"
+          >
+            API Reference
+          </a>
+        </div>
+      </div>
+      <div className="lg:col-span-5 hidden lg:block">
+        <div className="bg-[#1a1d27] dark:bg-[#1a1d27] rounded-2xl border border-[#27272a] dark:border-[#27272a] p-6 shadow-2xl">
+          <pre className="text-sm text-gray-300 dark:text-gray-300 overflow-x-auto"><code>{`use libffmpeg::ffmpeg::ffmpeg_graceful;
+use libffmpeg::libcmd::CommandMonitor;
+use tokio_util::sync::CancellationToken;
 
-Get your documentation site up and running in minutes.
+let monitor = CommandMonitor::with_capacity(100);
+let token = CancellationToken::new();
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+ffmpeg_graceful(token, &monitor.client, 
+  &monitor.server, |cmd| {
+    cmd.arg("-i").arg("input.mp4")
+       .arg("-c:v").arg("libx264")
+       .arg("output.mp4");
+}).await?;`}</code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
-## Make it yours
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Quick start</h2>
+  <p className="text-base text-gray-600 dark:text-gray-400 mb-8">Get up and running with libffmpeg in minutes</p>
+  
+  <Steps>
+    <Step title="Add to your Cargo.toml">
+      Add libffmpeg as a dependency to your project:
+      
+      ```toml
+      [dependencies]
+      libffmpeg = { git = "https://github.com/charliethomson/libffmpeg" }
+      tokio = { version = "1", features = ["rt", "process", "macros"] }
+      tokio-util = { version = "0.7" }
+      ```
+    </Step>
+    
+    <Step title="Set up tracing support">
+      Copy the Cargo config to enable tracing's unstable valuable support:
+      
+      ```bash
+      mkdir -p .cargo && curl -o .cargo/config.toml https://raw.githubusercontent.com/charliethomson/libffmpeg/refs/heads/main/.cargo/config.toml
+      ```
+    </Step>
+    
+    <Step title="Run your first transcode">
+      Use the slim mode for simple transcoding tasks:
+      
+      ```rust
+      use libffmpeg::ffmpeg::ffmpeg_slim;
+      use tokio_util::sync::CancellationToken;
+      
+      #[tokio::main]
+      async fn main() -> Result<(), Box<dyn std::error::Error>> {
+          let token = CancellationToken::new();
+          ffmpeg_slim(token, |cmd| {
+              cmd.arg("-i").arg("input.mp4")
+                 .arg("-c:v").arg("libx264")
+                 .arg("output.mp4");
+          }).await?;
+          Ok(())
+      }
+      ```
+    </Step>
+  </Steps>
+</div>
 
-Design a docs site that looks great and empowers your users.
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Explore by topic</h2>
+  <p className="text-base text-gray-600 dark:text-gray-400 mb-8">Learn core concepts and discover advanced features</p>
+  
+  <CardGroup cols={3}>
+    <Card title="Execution modes" icon="layer-group" href="/concepts/execution-modes">
+      Choose between slim, standard, and graceful execution modes
+    </Card>
+    <Card title="Progress parsing" icon="chart-line" href="/guides/progress-parsing">
+      Parse structured progress updates from ffmpeg output
+    </Card>
+    <Card title="Cancellation" icon="circle-stop" href="/concepts/cancellation">
+      Use CancellationToken for responsive shutdown
+    </Card>
+    <Card title="Binary discovery" icon="magnifying-glass" href="/concepts/binary-discovery">
+      Automatic ffmpeg/ffprobe detection with env var overrides
+    </Card>
+    <Card title="ffprobe" icon="file-video" href="/guides/ffprobe">
+      Extract media metadata and duration information
+    </Card>
+    <Card title="Monitoring" icon="display" href="/concepts/monitoring">
+      Stream stdout/stderr with CommandMonitor
+    </Card>
+  </CardGroup>
+</div>
 
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
-  </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
-  </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
-  </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
-  </Card>
-</Columns>
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Key features</h2>
+  <p className="text-base text-gray-600 dark:text-gray-400 mb-8">Built for production use with Rust async patterns</p>
+  
+  <div className="grid md:grid-cols-2 gap-6">
+    <div className="bg-white dark:bg-[#1a1d27] rounded-xl border border-gray-200 dark:border-[#27272a] p-6">
+      <div className="flex items-start gap-4">
+        <div className="flex-shrink-0 w-10 h-10 rounded-lg bg-[#00D26A]/10 dark:bg-[#00D26A]/10 flex items-center justify-center">
+          <svg className="w-6 h-6 text-[#00D26A]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+        </div>
+        <div>
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Async-first design</h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400">Built on tokio with full async/await support and CancellationToken integration</p>
+        </div>
+      </div>
+    </div>
+    
+    <div className="bg-white dark:bg-[#1a1d27] rounded-xl border border-gray-200 dark:border-[#27272a] p-6">
+      <div className="flex items-start gap-4">
+        <div className="flex-shrink-0 w-10 h-10 rounded-lg bg-[#00D26A]/10 dark:bg-[#00D26A]/10 flex items-center justify-center">
+          <svg className="w-6 h-6 text-[#00D26A]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+        </div>
+        <div>
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Graceful shutdown</h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400">Send 'q' to ffmpeg stdin before SIGKILL for clean transcoding termination</p>
+        </div>
+      </div>
+    </div>
+    
+    <div className="bg-white dark:bg-[#1a1d27] rounded-xl border border-gray-200 dark:border-[#27272a] p-6">
+      <div className="flex items-start gap-4">
+        <div className="flex-shrink-0 w-10 h-10 rounded-lg bg-[#00D26A]/10 dark:bg-[#00D26A]/10 flex items-center justify-center">
+          <svg className="w-6 h-6 text-[#00D26A]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z" />
+          </svg>
+        </div>
+        <div>
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Progress parsing</h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400">Structured Progress type from ffmpeg's -progress pipe:1 output</p>
+        </div>
+      </div>
+    </div>
+    
+    <div className="bg-white dark:bg-[#1a1d27] rounded-xl border border-gray-200 dark:border-[#27272a] p-6">
+      <div className="flex items-start gap-4">
+        <div className="flex-shrink-0 w-10 h-10 rounded-lg bg-[#00D26A]/10 dark:bg-[#00D26A]/10 flex items-center justify-center">
+          <svg className="w-6 h-6 text-[#00D26A]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+          </svg>
+        </div>
+        <div>
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Tracing integration</h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400">All functions instrumented with tracing spans and valuable support</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
-## Create beautiful pages
-
-Everything you need to create world-class documentation.
-
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
-
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="bg-gradient-to-br from-[#00D26A] to-[#00A054] rounded-2xl p-8 text-center">
+    <h2 className="text-3xl font-bold text-white mb-4">Ready to get started?</h2>
+    <p className="text-lg text-white/90 mb-6 max-w-2xl mx-auto">
+      Follow our quickstart guide to build your first ffmpeg application with Rust
+    </p>
+    <a
+      href="/quickstart"
+      className="inline-flex items-center px-6 py-3 rounded-lg bg-white text-[#00D26A] font-semibold hover:bg-gray-100 transition-colors"
+    >
+      View Quickstart
+    </a>
+  </div>
+</div>

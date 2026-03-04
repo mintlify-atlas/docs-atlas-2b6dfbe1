@@ -1,0 +1,269 @@
+---
+title: Installation
+description: Add libffmpeg to your Rust project and configure tracing support
+---
+
+# Installation
+
+This guide walks you through adding libffmpeg to your Rust project and configuring the required tracing features.
+
+## Add to Cargo.toml
+
+Add libffmpeg as a dependency in your `Cargo.toml`:
+
+```toml Cargo.toml
+[dependencies]
+libffmpeg = { git = "https://github.com/charliethomson/libffmpeg" }
+tokio = { version = "1.47", features = ["rt", "process", "sync", "time", "macros"] }
+tokio-util = { version = "0.7" }
+```
+
+<Note>
+  libffmpeg is currently distributed via GitHub. A crates.io release may be available in the future.
+</Note>
+
+### Additional Dependencies
+
+Depending on your use case, you may want to add:
+
+<CodeGroup>
+```toml Basic Usage
+[dependencies]
+libffmpeg = { git = "https://github.com/charliethomson/libffmpeg" }
+tokio = { version = "1.47", features = ["rt", "process", "sync", "macros"] }
+tokio-util = { version = "0.7" }
+```
+
+```toml With Tracing
+[dependencies]
+libffmpeg = { git = "https://github.com/charliethomson/libffmpeg" }
+tokio = { version = "1.47", features = ["rt", "process", "sync", "macros"] }
+tokio-util = { version = "0.7" }
+tracing = { version = "0.1", features = ["valuable"] }
+tracing-subscriber = "0.3"
+```
+
+```toml Full Example Setup
+[dependencies]
+libffmpeg = { git = "https://github.com/charliethomson/libffmpeg" }
+tokio = { version = "1.47", features = ["rt", "process", "sync", "time", "macros"] }
+tokio-util = { version = "0.7" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = { version = "0.1", features = ["valuable"] }
+tracing-subscriber = "0.3"
+```
+</CodeGroup>
+
+## Configure Tracing Support
+
+libffmpeg uses tracing's **unstable `valuable` feature** for structured logging. To enable this, you need to add a Cargo config file to your workspace.
+
+<Steps>
+  <Step title="Create .cargo directory">
+    ```bash
+    mkdir -p .cargo
+    ```
+  </Step>
+
+  <Step title="Download config.toml">
+    You can either download the config file directly or create it manually:
+
+    <CodeGroup>
+    ```bash Download
+    curl -o .cargo/config.toml https://raw.githubusercontent.com/charliethomson/libffmpeg/refs/heads/main/.cargo/config.toml
+    ```
+
+    ```toml Create Manually
+    # .cargo/config.toml
+    [net]
+    git-fetch-with-cli = true
+
+    [build]
+    rustflags = ["--cfg", "tracing_unstable"]
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Verify the configuration">
+    Your `.cargo/config.toml` should contain:
+
+    ```toml .cargo/config.toml
+    [net]
+    git-fetch-with-cli = true
+
+    [build]
+    rustflags = ["--cfg", "tracing_unstable"]
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  Without the `tracing_unstable` rustflag, you'll encounter compilation errors related to the `valuable` feature. This configuration is required for libffmpeg to work properly.
+</Warning>
+
+## Configure Binary Discovery
+
+libffmpeg automatically discovers `ffmpeg` and `ffprobe` binaries. The lookup order is:
+
+1. **Environment variables** (highest priority)
+2. **System PATH** (fallback)
+
+### Option 1: Use System Binaries
+
+If `ffmpeg` and `ffprobe` are in your system PATH, no additional configuration is needed:
+
+```bash
+# Verify binaries are accessible
+which ffmpeg
+which ffprobe
+```
+
+### Option 2: Custom Binary Paths
+
+Set environment variables to override the default lookup:
+
+```bash
+export LIBFFMPEG_FFMPEG_PATH=/opt/homebrew/bin/ffmpeg
+export LIBFFMPEG_FFPROBE_PATH=/opt/homebrew/bin/ffprobe
+```
+
+You can add these to your shell profile (`.bashrc`, `.zshrc`, etc.) or set them in your application:
+
+```rust
+use std::env;
+
+#[tokio::main]
+async fn main() {
+    // Set custom paths programmatically
+    env::set_var("LIBFFMPEG_FFMPEG_PATH", "/opt/homebrew/bin/ffmpeg");
+    env::set_var("LIBFFMPEG_FFPROBE_PATH", "/opt/homebrew/bin/ffprobe");
+    
+    // Now use libffmpeg...
+}
+```
+
+<Note>
+  libffmpeg validates that the path points to an executable file. If the binary is not found or not executable, you'll receive a `NotFound` error at runtime.
+</Note>
+
+## Install FFmpeg
+
+If you don't have ffmpeg installed on your system:
+
+<CodeGroup>
+```bash macOS (Homebrew)
+brew install ffmpeg
+```
+
+```bash Ubuntu/Debian
+sudo apt update
+sudo apt install ffmpeg
+```
+
+```bash Fedora
+sudo dnf install ffmpeg
+```
+
+```bash Windows (Chocolatey)
+choco install ffmpeg
+```
+
+```bash From Source
+# Download from https://ffmpeg.org/download.html
+# Follow platform-specific build instructions
+```
+</CodeGroup>
+
+Verify the installation:
+
+```bash
+ffmpeg -version
+ffprobe -version
+```
+
+## Verify Your Setup
+
+Create a minimal example to verify everything is configured correctly:
+
+```rust main.rs
+use libffmpeg::ffmpeg::ffmpeg_slim;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let token = CancellationToken::new();
+    
+    let result = ffmpeg_slim(token, |cmd| {
+        cmd.arg("-version");
+    }).await?;
+    
+    if result.exit_code.map(|e| e.success).unwrap_or(false) {
+        println!("✓ libffmpeg is configured correctly!");
+        println!("ffmpeg version output:");
+        for line in result.stdout_lines.iter().take(3) {
+            println!("  {}", line);
+        }
+    }
+    
+    Ok(())
+}
+```
+
+Run it:
+
+```bash
+cargo run
+```
+
+Expected output:
+```
+✓ libffmpeg is configured correctly!
+ffmpeg version output:
+  ffmpeg version 6.1.1 Copyright (c) 2000-2023 the FFmpeg developers
+  built with Apple clang version 15.0.0 (clang-1500.1.0.2.5)
+  configuration: --prefix=/opt/homebrew/Cellar/ffmpeg/6.1.1_1 ...
+```
+
+## Common Installation Issues
+
+<AccordionGroup>
+  <Accordion title="Compilation error: 'valuable' feature not found">
+    **Problem**: Missing `.cargo/config.toml` with tracing_unstable flag.
+    
+    **Solution**: Follow the "Configure Tracing Support" section above to create the config file.
+  </Accordion>
+
+  <Accordion title="Runtime error: FfmpegError::NotFound">
+    **Problem**: ffmpeg binary not found in PATH or environment variable.
+    
+    **Solution**: 
+    1. Install ffmpeg on your system
+    2. Verify with `which ffmpeg`
+    3. Or set `LIBFFMPEG_FFMPEG_PATH` environment variable
+  </Accordion>
+
+  <Accordion title="Git fetch fails during cargo build">
+    **Problem**: Git authentication issues or network problems.
+    
+    **Solution**: The `.cargo/config.toml` includes `git-fetch-with-cli = true` which helps with authentication. Ensure you have git credentials configured.
+  </Accordion>
+
+  <Accordion title="Permission denied when running ffmpeg">
+    **Problem**: Binary path is not executable.
+    
+    **Solution**: 
+    ```bash
+    chmod +x /path/to/ffmpeg
+    chmod +x /path/to/ffprobe
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+Now that libffmpeg is installed, follow the quickstart guide to build your first transcoding application:
+
+<Card title="Quickstart Guide" icon="rocket" href="/quickstart">
+  Build a complete transcoding application with progress monitoring
+</Card>

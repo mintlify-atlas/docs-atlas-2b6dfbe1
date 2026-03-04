@@ -1,0 +1,357 @@
+---
+title: "Using ffmpeg with Monitoring"
+description: "Learn how to use the standard ffmpeg function with real-time output monitoring"
+---
+
+## Overview
+
+The `ffmpeg` function runs FFmpeg with output monitoring via a `CommandMonitorServer`. Stdout and stderr lines are streamed in real-time, enabling progress parsing, logging, and user feedback during long-running encoding operations.
+
+## When to Use ffmpeg
+
+Use the standard `ffmpeg` function when:
+
+- You need to monitor FFmpeg's stdout/stderr output in real-time
+- You want to parse and display encoding progress
+- You need to capture and log FFmpeg messages
+- Immediate cancellation (SIGKILL) is acceptable
+
+For simple execution without monitoring, use [`ffmpeg_slim`](/guides/ffmpeg-slim). For graceful shutdown with stdin-based quit, use [`ffmpeg_graceful`](/guides/ffmpeg-graceful).
+
+## Function Signature
+
+```rust
+pub async fn ffmpeg<Prepare>(
+    cancellation_token: CancellationToken,
+    server: &CommandMonitorServer,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+where
+    Prepare: FnOnce(&mut Command),
+```
+
+## Parameters
+
+<ParamField path="cancellation_token" type="CancellationToken" required>
+  A tokio cancellation token for stopping the FFmpeg process
+</ParamField>
+
+<ParamField path="server" type="&CommandMonitorServer" required>
+  The server side of a CommandMonitor for receiving output lines
+</ParamField>
+
+<ParamField path="prepare" type="FnOnce(&mut Command)" required>
+  A closure that configures the FFmpeg command with arguments
+</ParamField>
+
+## Return Value
+
+Returns `Result<CommandExit, FfmpegError>` where:
+- `CommandExit` contains the exit code and captured output
+- `FfmpegError::NotFound` if the FFmpeg binary cannot be located
+
+## Basic Usage
+
+<Steps>
+  <Step title="Create a CommandMonitor">
+    Create a monitor with a buffer capacity for output lines:
+
+    ```rust
+    use libffmpeg::libcmd::CommandMonitor;
+
+    let monitor = CommandMonitor::with_capacity(100);
+    ```
+  </Step>
+
+  <Step title="Spawn a monitoring task">
+    Create a task to receive and process output:
+
+    ```rust
+    let mut client = monitor.client.clone();
+    let monitor_task = tokio::spawn(async move {
+        while let Some(Some(message)) = client.recv().await {
+            match message {
+                CommandMonitorMessage::Stdout { line } => {
+                    println!("[OUT] {}", line);
+                }
+                CommandMonitorMessage::Stderr { line } => {
+                    eprintln!("[ERR] {}", line);
+                }
+            }
+        }
+    });
+    ```
+  </Step>
+
+  <Step title="Run FFmpeg with monitoring">
+    Execute FFmpeg with the monitor server:
+
+    ```rust
+    use libffmpeg::ffmpeg::ffmpeg;
+
+    let result = ffmpeg(cancellation_token, &monitor.server, |cmd| {
+        cmd.arg("-i").arg("input.mp4");
+        cmd.arg("-c:v").arg("libx264");
+        cmd.arg("-preset").arg("fast");
+        cmd.arg("output.mp4");
+    }).await?;
+    ```
+  </Step>
+
+  <Step title="Wait for monitoring to complete">
+    Ensure the monitoring task finishes:
+
+    ```rust
+    monitor_task.await?;
+    ```
+  </Step>
+</Steps>
+
+## Complete Example with Progress Tracking
+
+This example is adapted from `libffmpeg/examples/transcode_with_progress.rs:19-110`:
+
+```rust
+use std::{path::PathBuf, time::Duration};
+use libffmpeg::ffmpeg::ffmpeg;
+use libffmpeg::libcmd::{CommandMonitor, CommandMonitorMessage};
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let input = PathBuf::from("input.mp4");
+    let output = PathBuf::from("output.mp4");
+    
+    // Create tokens for lifecycle management
+    let root_token = CancellationToken::new();
+    let transcode_token = root_token.child_token();
+    let exit_token = root_token.child_token();
+    
+    // Get video duration for progress calculation
+    let video_duration = libffmpeg::util::get_duration(
+        &input,
+        root_token.child_token()
+    ).await?;
+    let total_seconds = video_duration.as_secs() as f64;
+    
+    // Create monitor with 100-line buffer
+    let monitor = CommandMonitor::with_capacity(100);
+    
+    // Spawn monitoring task
+    let monitor_task = {
+        let mut client = monitor.client.clone();
+        let exit_token = exit_token.clone();
+        
+        tokio::spawn(async move {
+            let mut progress = libffmpeg::ffmpeg::progress::PartialProgress::default();
+            
+            while let Some(Some(message)) = client.recv().await {
+                match message {
+                    CommandMonitorMessage::Stdout { line } => {
+                        // Try to parse as progress line
+                        if !progress.with_line(&line) {
+                            // Not a progress line, print it
+                            println!("[OUT] {}", line);
+                            continue;
+                        }
+                        
+                        // Check if progress block is complete
+                        if let Some(update) = progress.finish() {
+                            let percent = 100.0 * update.out_time.as_secs_f64() / total_seconds;
+                            println!(
+                                "Progress: {:.2}% | Frame: {} | FPS: {:.1} | Speed: {:.1}x",
+                                percent,
+                                update.frame,
+                                update.fps,
+                                update.speed
+                            );
+                        }
+                    }
+                    CommandMonitorMessage::Stderr { line } => {
+                        eprintln!("[ERR] {}", line);
+                    }
+                }
+            }
+        })
+    };
+    
+    // Run FFmpeg with progress output
+    let result = ffmpeg(transcode_token, &monitor.server, |cmd| {
+        cmd.arg("-i").arg(&input);
+        cmd.arg("-c:v").arg("libx264");
+        cmd.arg("-preset").arg("fast");
+        cmd.arg("-crf").arg("23");
+        cmd.arg("-c:a").arg("aac");
+        cmd.arg("-b:a").arg("128k");
+        cmd.arg("-progress").arg("pipe:1"); // Output progress to stdout
+        cmd.arg("-y"); // Overwrite output
+        cmd.arg(&output);
+    }).await?;
+    
+    // Signal monitoring to stop
+    exit_token.cancel();
+    
+    // Wait for monitor task
+    if let Err(e) = monitor_task.await {
+        eprintln!("Monitor task error: {}", e);
+    }
+    
+    // Check result
+    if result.exit_code.as_ref().map(|e| e.success).unwrap_or(false) {
+        println!("Transcoding completed successfully!");
+    } else {
+        eprintln!("Transcoding failed: {:?}", result);
+    }
+    
+    Ok(())
+}
+```
+
+## Output Monitoring Patterns
+
+### Simple Logging
+
+```rust
+let mut client = monitor.client.clone();
+tokio::spawn(async move {
+    while let Some(Some(msg)) = client.recv().await {
+        match msg {
+            CommandMonitorMessage::Stdout { line } => println!("[OUT] {}", line),
+            CommandMonitorMessage::Stderr { line } => eprintln!("[ERR] {}", line),
+        }
+    }
+});
+```
+
+### Filtering Specific Messages
+
+```rust
+let mut client = monitor.client.clone();
+tokio::spawn(async move {
+    while let Some(Some(msg)) = client.recv().await {
+        if let CommandMonitorMessage::Stderr { line } = msg {
+            if line.contains("warning") {
+                eprintln!("Warning: {}", line);
+            } else if line.contains("error") {
+                eprintln!("Error: {}", line);
+            }
+        }
+    }
+});
+```
+
+### Cancellation-Aware Monitoring
+
+```rust
+use tokio_util::future::FutureExt;
+
+let mut client = monitor.client.clone();
+let exit_token = CancellationToken::new();
+
+tokio::spawn(async move {
+    while let Some(Some(msg)) = client.recv()
+        .with_cancellation_token(&exit_token)
+        .await 
+    {
+        // Process messages
+    }
+});
+
+// Later, stop monitoring
+exit_token.cancel();
+```
+
+<Tip>
+  Use `-progress pipe:1` in your FFmpeg command to output structured progress information to stdout. See the [Progress Parsing guide](/guides/progress-parsing) for details.
+</Tip>
+
+## Cancellation Behavior
+
+When the cancellation token is cancelled, `ffmpeg` immediately kills the FFmpeg process:
+
+```rust
+let cancellation_token = CancellationToken::new();
+let token_clone = cancellation_token.clone();
+
+// Start FFmpeg
+let ffmpeg_task = tokio::spawn(async move {
+    ffmpeg(token_clone, &monitor.server, |cmd| {
+        cmd.arg("-i").arg("input.mp4");
+        cmd.arg("output.mp4");
+    }).await
+});
+
+// Cancel after timeout
+tokio::time::sleep(Duration::from_secs(30)).await;
+cancellation_token.cancel();
+```
+
+<Warning>
+  Immediate cancellation may result in incomplete or corrupted output files. FFmpeg doesn't get a chance to finalize the file header or write the moov atom. For proper file finalization, use [`ffmpeg_graceful`](/guides/ffmpeg-graceful) which sends a quit command to FFmpeg before killing it.
+</Warning>
+
+## Implementation Details
+
+From the source code at `libffmpeg/src/ffmpeg/standard.rs:16-52`:
+
+```rust
+pub async fn ffmpeg<Prepare>(
+    cancellation_token: CancellationToken,
+    server: &CommandMonitorServer,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+where
+    Prepare: FnOnce(&mut Command),
+{
+    tracing::debug!("Starting ffmpeg execution");
+
+    let ffmpeg_path = find_ffmpeg().ok_or(FfmpegError::NotFound).inspect_err(
+        |e| tracing::error!(error =% e, error_context =? e, "ffmpeg binary not found"),
+    )?;
+
+    tracing::info!(
+        ffmpeg_path = %ffmpeg_path.display(),
+        "Executing ffmpeg"
+    );
+
+    libcmd::run(
+        ffmpeg_path,
+        Some(server.clone()),
+        cancellation_token.child_token(),
+        prepare,
+    )
+    .await
+    .inspect(|exit| {
+        tracing::debug!(exit = exit.as_value(), "ffmpeg completed");
+    })
+    .inspect_err(|e| {
+        tracing::error!(
+            error = %e,
+            "ffmpeg execution failed"
+        );
+    })
+    .map_err(Into::into)
+}
+```
+
+Key differences from `ffmpeg_slim`:
+- Passes `Some(server.clone())` instead of `None` for monitoring
+- Output lines are streamed to the monitor's client
+- Includes structured tracing
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Parse Progress" icon="chart-line" href="/guides/progress-parsing">
+    Use PartialProgress to parse FFmpeg progress output
+  </Card>
+  <Card title="Graceful Shutdown" icon="circle-stop" href="/guides/ffmpeg-graceful">
+    Properly finalize files with ffmpeg_graceful
+  </Card>
+  <Card title="Simple Execution" icon="bolt" href="/guides/ffmpeg-slim">
+    Use ffmpeg_slim when monitoring isn't needed
+  </Card>
+  <Card title="Get Duration" icon="clock" href="/guides/duration-extraction">
+    Extract media duration before transcoding
+  </Card>
+</CardGroup>

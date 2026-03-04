@@ -1,0 +1,117 @@
+---
+title: "ffprobe"
+description: "Function for executing ffprobe to extract media information"
+---
+
+The `ffprobe` module provides functionality to run ffprobe with cancellation support for extracting media file metadata.
+
+## ffprobe
+
+Run ffprobe with cancellation support.
+
+Locates the ffprobe binary (via `LIBFFMPEG_FFPROBE_PATH` or `$PATH`), spawns it with the arguments configured by `prepare`, and returns the captured stdout/stderr and exit code.
+
+```rust
+pub async fn ffprobe<Prepare>(
+    cancellation_token: CancellationToken,
+    prepare: Prepare,
+) -> Result<CommandExit, FfprobeError>
+where
+    Prepare: FnOnce(&mut Command),
+```
+
+### Parameters
+
+<ParamField path="cancellation_token" type="CancellationToken" required>
+  A token to cancel the ffprobe process. When cancelled, the process is killed immediately.
+</ParamField>
+
+<ParamField path="prepare" type="FnOnce(&mut Command)" required>
+  A closure that configures the ffprobe command before execution. Use this to add arguments such as input file, output format, show entries, etc.
+</ParamField>
+
+### Returns
+
+Returns `Result<CommandExit, FfprobeError>`:
+- `Ok(CommandExit)` - Contains the exit code, stdout, and stderr from the ffprobe process
+- `Err(FfprobeError::NotFound)` - The ffprobe binary could not be found in PATH or via `LIBFFMPEG_FFPROBE_PATH`
+
+### Finding ffprobe
+
+The function locates the ffprobe binary in the following order:
+1. From the `LIBFFMPEG_FFPROBE_PATH` environment variable
+2. From the system `$PATH`
+
+If neither location contains ffprobe, the function returns `FfprobeError::NotFound`.
+
+### Example
+
+```rust
+use libffmpeg::ffprobe;
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let result = ffprobe(token, |cmd| {
+    cmd.arg("-v").arg("quiet")
+        .arg("-print_format").arg("json")
+        .arg("-show_format")
+        .arg("-show_streams")
+        .arg("input.mp4");
+}).await?;
+
+// Parse the JSON output
+let output = String::from_utf8_lossy(&result.stdout_lines.join("\n"));
+println!("Media info: {}", output);
+```
+
+### Common Use Cases
+
+#### Get video duration
+
+```rust
+use libffmpeg::ffprobe;
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let result = ffprobe(token, |cmd| {
+    cmd.arg("-v").arg("quiet")
+        .arg("-show_entries").arg("format=duration")
+        .arg("-of").arg("default=noprint_wrappers=1:nokey=1")
+        .arg("video.mp4");
+}).await?;
+
+let duration = result.stdout_lines.first()
+    .and_then(|s| s.parse::<f64>().ok())
+    .unwrap_or(0.0);
+```
+
+#### Get stream information
+
+```rust
+use libffmpeg::ffprobe;
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let result = ffprobe(token, |cmd| {
+    cmd.arg("-v").arg("quiet")
+        .arg("-print_format").arg("json")
+        .arg("-show_streams")
+        .arg("input.mp4");
+}).await?;
+```
+
+#### Get codec information
+
+```rust
+use libffmpeg::ffprobe;
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let result = ffprobe(token, |cmd| {
+    cmd.arg("-v").arg("quiet")
+        .arg("-show_entries")
+        .arg("stream=codec_name,codec_type")
+        .arg("-of").arg("compact")
+        .arg("media.mp4");
+}).await?;
+```

@@ -1,0 +1,403 @@
+---
+title: "Binary Discovery"
+description: "How libffmpeg locates ffmpeg and ffprobe binaries using environment variables and PATH"
+---
+
+libffmpeg automatically discovers ffmpeg and ffprobe binaries on your system using a two-stage lookup process: environment variables first, then PATH search.
+
+## Overview
+
+Binary discovery happens automatically when you call any execution function. The library searches for binaries in this order:
+
+1. **Environment variable override** - Check specific env var for custom path
+2. **PATH search** - Search system PATH for the binary
+
+If a binary cannot be found, a `FfmpegError::NotFound` or `FfprobeError::NotFound` error is returned.
+
+## Environment Variables
+
+libffmpeg supports environment variable overrides for both binaries:
+
+### LIBFFMPEG_FFMPEG_PATH
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/find.rs:5`:
+
+```rust
+pub const FFMPEG_PATH_OVERRIDE_KEY: &str = "LIBFFMPEG_FFMPEG_PATH";
+```
+
+Set this to specify a custom path to the ffmpeg binary:
+
+```bash
+export LIBFFMPEG_FFMPEG_PATH=/opt/ffmpeg/bin/ffmpeg
+```
+
+### LIBFFMPEG_FFPROBE_PATH
+
+From `~/workspace/source/libffmpeg/src/ffprobe/find.rs:5`:
+
+```rust
+pub const FFPROBE_PATH_OVERRIDE_KEY: &str = "LIBFFMPEG_FFPROBE_PATH";
+```
+
+Set this to specify a custom path to the ffprobe binary:
+
+```bash
+export LIBFFMPEG_FFPROBE_PATH=/opt/ffmpeg/bin/ffprobe
+```
+
+<Note>
+Environment variables take precedence over PATH searches. If set, the library will use the specified path without falling back to PATH.
+</Note>
+
+## Discovery Functions
+
+### find_ffmpeg()
+
+Locates the ffmpeg binary on the system.
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/find.rs:7-9`:
+
+```rust
+pub fn find_ffmpeg() -> Option<PathBuf> {
+    find_binary("ffmpeg", FFMPEG_PATH_OVERRIDE_KEY)
+}
+```
+
+**Returns:**
+- `Some(PathBuf)` - Path to the ffmpeg binary
+- `None` - Binary not found
+
+### find_ffprobe()
+
+Locates the ffprobe binary on the system.
+
+From `~/workspace/source/libffmpeg/src/ffprobe/find.rs:7-9`:
+
+```rust
+pub fn find_ffprobe() -> Option<PathBuf> {
+    find_binary("ffprobe", FFPROBE_PATH_OVERRIDE_KEY)
+}
+```
+
+**Returns:**
+- `Some(PathBuf)` - Path to the ffprobe binary
+- `None` - Binary not found
+
+## Implementation Details
+
+Both discovery functions use the shared `find_binary` utility function.
+
+### find_binary()
+
+From `~/workspace/source/libffmpeg/src/util/find.rs:10-24`:
+
+```rust
+pub fn find_binary(name: &str, env_key: &str) -> Option<PathBuf> {
+    if let Some(path) = try_env(env_key) {
+        return Some(path);
+    }
+
+    which(&[name])
+        .inspect_err(|e| {
+            tracing::error!(
+                error = %e,
+                "libwhich failed to find ffmpeg binary"
+            );
+        })
+        .ok()?
+        .next()
+}
+```
+
+### Environment Lookup
+
+From `~/workspace/source/libffmpeg/src/util/find.rs:5-8`:
+
+```rust
+fn try_env(key: &str) -> Option<PathBuf> {
+    let path = std::env::var_os(key).map(PathBuf::from)?;
+    is_valid_executable(&path)
+}
+```
+
+The `try_env` function:
+1. Reads the environment variable
+2. Converts it to a `PathBuf`
+3. Validates that the path points to a valid executable using `is_valid_executable()` from the `libwhich` crate
+
+<Warning>
+If the environment variable is set but points to an invalid or non-executable file, the discovery will fail and NOT fall back to PATH search. Ensure the path is correct and executable.
+</Warning>
+
+### PATH Search
+
+If no environment variable is set (or it's invalid), the library uses the `which` function from `libwhich` to search the system PATH:
+
+```rust
+which(&[name])
+    .inspect_err(|e| {
+        tracing::error!(
+            error = %e,
+            "libwhich failed to find ffmpeg binary"
+        );
+    })
+    .ok()?
+    .next()
+```
+
+The search:
+- Looks for the binary name in all PATH directories
+- Returns the first valid executable found
+- Logs an error if the search fails
+- Returns `None` if no binary is found
+
+## Error Handling
+
+When a binary cannot be found, execution functions return a descriptive error.
+
+### FfmpegError::NotFound
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/error.rs:20-23`:
+
+```rust
+#[error(
+    "Unable to locate ffmpeg on your PATH, set LIBFFMPEG_FFMPEG_PATH to the binary, or update your PATH"
+)]
+NotFound,
+```
+
+This error is returned when `find_ffmpeg()` returns `None`:
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/slim.rs:24-26`:
+
+```rust
+let ffmpeg_path = find_ffmpeg().ok_or(FfmpegError::NotFound).inspect_err(
+    |e| tracing::error!(error =% e, error_context =? e, "ffmpeg binary not found"),
+)?;
+```
+
+### Error Message Guidance
+
+The error message provides two solutions:
+1. **Set environment variable** - `LIBFFMPEG_FFMPEG_PATH` or `LIBFFMPEG_FFPROBE_PATH`
+2. **Update PATH** - Add the directory containing the binary to your system PATH
+
+## Usage Examples
+
+### Using System PATH
+
+If ffmpeg is already in your PATH, no configuration is needed:
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg_slim;
+use tokio_util::sync::CancellationToken;
+
+// Automatically finds ffmpeg in PATH
+let result = ffmpeg_slim(CancellationToken::new(), |cmd| {
+    cmd.arg("-version");
+}).await?;
+```
+
+### Using Environment Variable
+
+Set the environment variable before running your application:
+
+```bash
+# In your shell
+export LIBFFMPEG_FFMPEG_PATH=/usr/local/bin/ffmpeg-custom
+export LIBFFMPEG_FFPROBE_PATH=/usr/local/bin/ffprobe-custom
+
+# Run your application
+cargo run
+```
+
+Or set it programmatically:
+
+```rust
+use std::env;
+
+// Set before calling any libffmpeg functions
+env::set_var("LIBFFMPEG_FFMPEG_PATH", "/opt/ffmpeg/bin/ffmpeg");
+env::set_var("LIBFFMPEG_FFPROBE_PATH", "/opt/ffmpeg/bin/ffprobe");
+
+// Now discovery will use the custom paths
+let result = ffmpeg_slim(token, |cmd| {
+    cmd.arg("-version");
+}).await?;
+```
+
+### Verifying Binary Location
+
+You can manually check which binary will be used:
+
+```rust
+use libffmpeg::ffmpeg::find_ffmpeg;
+use libffmpeg::ffprobe::find_ffprobe;
+
+if let Some(ffmpeg_path) = find_ffmpeg() {
+    println!("Using ffmpeg: {}", ffmpeg_path.display());
+} else {
+    eprintln!("ffmpeg not found!");
+}
+
+if let Some(ffprobe_path) = find_ffprobe() {
+    println!("Using ffprobe: {}", ffprobe_path.display());
+} else {
+    eprintln!("ffprobe not found!");
+}
+```
+
+<Tip>
+The `find_ffmpeg()` and `find_ffprobe()` functions are not exported in the public API by default. They are internal implementation details, but the same logic is used by all execution functions.
+</Tip>
+
+## Docker and Container Environments
+
+When running in containers, ensure ffmpeg is installed and available:
+
+### Dockerfile Example
+
+```dockerfile
+FROM rust:1.75 as builder
+
+# Install ffmpeg
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build your application
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+# Install ffmpeg runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/myapp /usr/local/bin/
+
+CMD ["myapp"]
+```
+
+### Custom Binary Location
+
+If using a custom ffmpeg build in Docker:
+
+```dockerfile
+FROM rust:1.75
+
+# Copy custom ffmpeg binary
+COPY --from=ffmpeg-builder /usr/local/bin/ffmpeg /opt/ffmpeg/bin/ffmpeg
+COPY --from=ffmpeg-builder /usr/local/bin/ffprobe /opt/ffmpeg/bin/ffprobe
+
+# Set environment variables
+ENV LIBFFMPEG_FFMPEG_PATH=/opt/ffmpeg/bin/ffmpeg
+ENV LIBFFMPEG_FFPROBE_PATH=/opt/ffmpeg/bin/ffprobe
+
+# Your application
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+```
+
+## Troubleshooting
+
+### Binary Not Found
+
+If you encounter `FfmpegError::NotFound`:
+
+<Steps>
+  <Step title="Check if ffmpeg is installed">
+    ```bash
+    which ffmpeg
+    ffmpeg -version
+    ```
+  </Step>
+  
+  <Step title="Verify PATH includes ffmpeg directory">
+    ```bash
+    echo $PATH
+    ```
+  </Step>
+  
+  <Step title="Set environment variable as override">
+    ```bash
+    export LIBFFMPEG_FFMPEG_PATH=$(which ffmpeg)
+    ```
+  </Step>
+  
+  <Step title="Check file permissions">
+    ```bash
+    ls -l $(which ffmpeg)
+    # Should show executable permissions (x)
+    ```
+  </Step>
+</Steps>
+
+### Environment Variable Not Working
+
+<Warning>
+Environment variables must be set BEFORE your Rust application reads them. Setting them after the process starts has no effect.
+</Warning>
+
+Verify the variable is set:
+
+```bash
+# In your shell
+echo $LIBFFMPEG_FFMPEG_PATH
+
+# Or in Rust
+println!("LIBFFMPEG_FFMPEG_PATH = {:?}", std::env::var("LIBFFMPEG_FFMPEG_PATH"));
+```
+
+### Permission Denied
+
+If the binary is found but can't be executed:
+
+```bash
+# Make it executable
+chmod +x /path/to/ffmpeg
+
+# Check permissions
+ls -l /path/to/ffmpeg
+```
+
+## Tracing and Debugging
+
+libffmpeg uses the `tracing` crate for logging. Enable trace-level logs to see discovery details:
+
+```rust
+use tracing_subscriber;
+
+tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::TRACE)
+    .init();
+
+// Now you'll see discovery logs
+let result = ffmpeg_slim(token, |cmd| {
+    cmd.arg("-version");
+}).await?;
+```
+
+Example log output:
+
+```
+TRACE libffmpeg::util::find: Looking for binary "ffmpeg" with env key "LIBFFMPEG_FFMPEG_PATH"
+INFO  libffmpeg::ffmpeg::slim: Executing ffmpeg ffmpeg_path=/usr/bin/ffmpeg
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Execution Modes" icon="play" href="/concepts/execution-modes">
+    Choose the right execution mode for your use case
+  </Card>
+  <Card title="Error Handling" icon="triangle-exclamation" href="/api/errors">
+    Handle discovery and execution errors
+  </Card>
+</CardGroup>

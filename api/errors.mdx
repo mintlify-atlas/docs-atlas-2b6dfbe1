@@ -1,0 +1,226 @@
+---
+title: 'Error Types'
+description: 'Error types for ffmpeg, ffprobe, and duration operations'
+---
+
+## FfmpegError
+
+Errors that can occur when running ffmpeg.
+
+This enum wraps errors from command execution, binary resolution, and cases where the ffmpeg binary cannot be found in the system PATH.
+
+### Variants
+
+<ResponseField name="Command" type="variant">
+  An error occurred while executing the ffmpeg command.
+  
+  **Fields:**
+  - `inner_error: CommandError` - The underlying command execution error
+  
+  This variant is automatically converted from `CommandError` via the `From` trait.
+</ResponseField>
+
+<ResponseField name="Which" type="variant">
+  An error occurred while trying to locate the ffmpeg binary.
+  
+  **Fields:**
+  - `inner_error: WhichError` - The underlying binary resolution error
+  
+  This variant is automatically converted from `WhichError` via the `From` trait.
+</ResponseField>
+
+<ResponseField name="NotFound" type="variant">
+  Unable to locate ffmpeg on your PATH.
+  
+  To resolve this error:
+  - Set the `LIBFFMPEG_FFMPEG_PATH` environment variable to point to the ffmpeg binary
+  - Update your system PATH to include the directory containing ffmpeg
+</ResponseField>
+
+### Example
+
+```rust
+use libffmpeg::ffmpeg::FfmpegError;
+
+async fn encode_video() -> Result<(), FfmpegError> {
+    // If ffmpeg is not found, this will return FfmpegError::NotFound
+    // If command execution fails, this will return FfmpegError::Command
+    todo!()
+}
+
+fn handle_error(err: FfmpegError) {
+    match err {
+        FfmpegError::NotFound => {
+            eprintln!("Please install ffmpeg or set LIBFFMPEG_FFMPEG_PATH");
+        }
+        FfmpegError::Command { inner_error } => {
+            eprintln!("Command failed: {}", inner_error);
+        }
+        FfmpegError::Which { inner_error } => {
+            eprintln!("Failed to locate binary: {}", inner_error);
+        }
+    }
+}
+```
+
+## FfprobeError
+
+Errors that can occur when running ffprobe.
+
+This enum wraps errors from command execution, binary resolution, and cases where the ffprobe binary cannot be found in the system PATH.
+
+### Variants
+
+<ResponseField name="Command" type="variant">
+  An error occurred while executing the ffprobe command.
+  
+  **Fields:**
+  - `inner_error: CommandError` - The underlying command execution error
+  
+  This variant is automatically converted from `CommandError` via the `From` trait.
+</ResponseField>
+
+<ResponseField name="Which" type="variant">
+  An error occurred while trying to locate the ffprobe binary.
+  
+  **Fields:**
+  - `inner_error: WhichError` - The underlying binary resolution error
+  
+  This variant is automatically converted from `WhichError` via the `From` trait.
+</ResponseField>
+
+<ResponseField name="NotFound" type="variant">
+  Unable to locate ffprobe on your PATH.
+  
+  To resolve this error:
+  - Set the `LIBFFMPEG_FFPROBE_PATH` environment variable to point to the ffprobe binary
+  - Update your system PATH to include the directory containing ffprobe
+</ResponseField>
+
+### Example
+
+```rust
+use libffmpeg::ffprobe::FfprobeError;
+
+async fn probe_video() -> Result<(), FfprobeError> {
+    // If ffprobe is not found, this will return FfprobeError::NotFound
+    // If command execution fails, this will return FfprobeError::Command
+    todo!()
+}
+
+fn handle_error(err: FfprobeError) {
+    match err {
+        FfprobeError::NotFound => {
+            eprintln!("Please install ffprobe or set LIBFFMPEG_FFPROBE_PATH");
+        }
+        FfprobeError::Command { inner_error } => {
+            eprintln!("Command failed: {}", inner_error);
+        }
+        FfprobeError::Which { inner_error } => {
+            eprintln!("Failed to locate binary: {}", inner_error);
+        }
+    }
+}
+```
+
+## DurationError
+
+Errors that can occur when extracting a media file's duration via ffprobe.
+
+This enum covers all failure modes of the `get_duration` function, including ffprobe execution errors, subprocess issues, and parsing failures.
+
+### Variants
+
+<ResponseField name="Ffprobe" type="variant">
+  An error occurred in the underlying ffprobe execution.
+  
+  **Fields:**
+  - `inner_error: FfprobeError` - The ffprobe error that occurred
+  
+  This variant is automatically converted from `FfprobeError` via the `From` trait.
+</ResponseField>
+
+<ResponseField name="IncompleteSubprocess" type="variant">
+  Process returned, but no exit status was present.
+  
+  **Fields:**
+  - `result: CommandExit` - The incomplete command result containing stdout and stderr lines
+  
+  This error indicates an unexpected subprocess state where the process completed but did not provide an exit code.
+</ResponseField>
+
+<ResponseField name="ExitedUnsuccessfully" type="variant">
+  ffprobe exited with a non-zero exit code.
+  
+  **Fields:**
+  - `exit_code: CommandExitCode` - The exit code information from ffprobe
+  
+  This error occurs when ffprobe runs but fails to complete successfully.
+</ResponseField>
+
+<ResponseField name="ExpectedLine" type="variant">
+  Expected ffprobe to output a line with the duration, but no output was received.
+  
+  **Fields:**
+  - `result: CommandExit` - The command result showing the actual stdout and stderr lines received
+  
+  This error occurs when ffprobe completes successfully but does not produce the expected duration output.
+</ResponseField>
+
+<ResponseField name="Parse" type="variant">
+  Failed to parse the duration value provided by ffprobe.
+  
+  **Fields:**
+  - `inner_error: AnyError` - The parsing error that occurred
+  
+  This error occurs when ffprobe outputs a duration value, but it cannot be parsed as a valid floating-point number.
+</ResponseField>
+
+### Example
+
+```rust
+use libffmpeg::util::duration::{get_duration, DurationError};
+use tokio_util::sync::CancellationToken;
+use std::path::Path;
+
+async fn check_video_length(path: &Path) -> Result<(), DurationError> {
+    let token = CancellationToken::new();
+    
+    match get_duration(path, token).await {
+        Ok(duration) => {
+            println!("Video duration: {:?}", duration);
+            Ok(())
+        }
+        Err(e) => {
+            match &e {
+                DurationError::Ffprobe { .. } => {
+                    eprintln!("Failed to run ffprobe: {}", e);
+                }
+                DurationError::NotFound => {
+                    eprintln!("ffprobe binary not found");
+                }
+                DurationError::Parse { .. } => {
+                    eprintln!("Could not parse duration output");
+                }
+                _ => {
+                    eprintln!("Duration extraction failed: {}", e);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+```
+
+### Related Functions
+
+The `get_duration` function returns this error type:
+
+```rust
+pub async fn get_duration<P: AsRef<Path>>(
+    input: P,
+    cancellation_token: CancellationToken,
+) -> Result<Duration, DurationError>
+```
+
+Extract the duration of a media file using ffprobe. Runs ffprobe in quiet mode and parses the `format=duration` entry from the output.

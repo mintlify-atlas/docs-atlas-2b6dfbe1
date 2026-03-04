@@ -1,0 +1,253 @@
+---
+title: "Using ffmpeg_slim"
+description: "Learn how to use ffmpeg_slim for lightweight FFmpeg execution with cancellation support"
+---
+
+## Overview
+
+The `ffmpeg_slim` function is the lightest-weight variant for running FFmpeg commands. It spawns FFmpeg, waits for completion, and returns the exit result without any output monitoring or graceful shutdown capabilities.
+
+## When to Use ffmpeg_slim
+
+Use `ffmpeg_slim` when:
+
+- You need simple FFmpeg execution with minimal overhead
+- You don't need to monitor stdout/stderr output
+- You don't need graceful shutdown capabilities
+- Basic cancellation support is sufficient
+
+For output monitoring, use [`ffmpeg`](/guides/ffmpeg-standard) instead. For graceful shutdown with proper file finalization, use [`ffmpeg_graceful`](/guides/ffmpeg-graceful).
+
+## Function Signature
+
+```rust
+pub async fn ffmpeg_slim<Prepare>(
+    cancellation_token: CancellationToken,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+where
+    Prepare: FnOnce(&mut Command),
+```
+
+## Parameters
+
+<ParamField path="cancellation_token" type="CancellationToken" required>
+  A tokio cancellation token for stopping the FFmpeg process
+</ParamField>
+
+<ParamField path="prepare" type="FnOnce(&mut Command)" required>
+  A closure that configures the FFmpeg command with arguments
+</ParamField>
+
+## Return Value
+
+Returns `Result<CommandExit, FfmpegError>` where:
+- `CommandExit` contains the exit code and any captured output
+- `FfmpegError::NotFound` if the FFmpeg binary cannot be located
+
+## Basic Usage
+
+<Steps>
+  <Step title="Create a cancellation token">
+    Create a `CancellationToken` to control process lifetime:
+
+    ```rust
+    use tokio_util::sync::CancellationToken;
+
+    let cancellation_token = CancellationToken::new();
+    ```
+  </Step>
+
+  <Step title="Call ffmpeg_slim with your command">
+    Use the `prepare` closure to configure FFmpeg arguments:
+
+    ```rust
+    use libffmpeg::ffmpeg::ffmpeg_slim;
+
+    let result = ffmpeg_slim(cancellation_token, |cmd| {
+        cmd.arg("-i").arg("input.mp4");
+        cmd.arg("-c:v").arg("libx264");
+        cmd.arg("-preset").arg("fast");
+        cmd.arg("-crf").arg("23");
+        cmd.arg("output.mp4");
+    }).await?;
+    ```
+  </Step>
+
+  <Step title="Check the result">
+    Verify the command executed successfully:
+
+    ```rust
+    if result.exit_code.as_ref().map(|e| e.success).unwrap_or(false) {
+        println!("Transcoding completed successfully");
+    } else {
+        eprintln!("FFmpeg failed: {:?}", result);
+    }
+    ```
+  </Step>
+</Steps>
+
+## Complete Example
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg_slim;
+use tokio_util::sync::CancellationToken;
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let input = PathBuf::from("input.mp4");
+    let output = PathBuf::from("output.mp4");
+    
+    // Create cancellation token
+    let cancellation_token = CancellationToken::new();
+    
+    // Run FFmpeg with slim variant
+    let result = ffmpeg_slim(cancellation_token, |cmd| {
+        cmd.arg("-i").arg(&input);
+        cmd.arg("-c:v").arg("libx264");
+        cmd.arg("-preset").arg("fast");
+        cmd.arg("-crf").arg("23");
+        cmd.arg("-c:a").arg("aac");
+        cmd.arg("-b:a").arg("128k");
+        cmd.arg("-y"); // Overwrite output
+        cmd.arg(&output);
+    }).await?;
+    
+    // Check exit status
+    match result.exit_code {
+        Some(exit) if exit.success => {
+            println!("Transcoding completed successfully");
+            Ok(())
+        }
+        Some(exit) => {
+            anyhow::bail!("FFmpeg exited with code: {:?}", exit.code);
+        }
+        None => {
+            anyhow::bail!("FFmpeg process terminated without exit code");
+        }
+    }
+}
+```
+
+## Cancellation Support
+
+Cancel the FFmpeg process at any time by calling `cancel()` on the token:
+
+```rust
+let cancellation_token = CancellationToken::new();
+let token_clone = cancellation_token.clone();
+
+// Spawn FFmpeg in background
+tokio::spawn(async move {
+    ffmpeg_slim(token_clone, |cmd| {
+        cmd.arg("-i").arg("input.mp4");
+        cmd.arg("output.mp4");
+    }).await
+});
+
+// Cancel after 10 seconds
+tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+cancellation_token.cancel();
+```
+
+<Note>
+  When cancelled, `ffmpeg_slim` immediately kills the FFmpeg process. This may result in incomplete or corrupted output files. For graceful shutdown that allows FFmpeg to finalize files properly, use [`ffmpeg_graceful`](/guides/ffmpeg-graceful) instead.
+</Note>
+
+## Binary Discovery
+
+The function automatically locates the FFmpeg binary by:
+
+1. Checking the `LIBFFMPEG_FFMPEG_PATH` environment variable
+2. Searching the system `PATH`
+
+If FFmpeg cannot be found, the function returns `FfmpegError::NotFound`.
+
+<Tip>
+  Set `LIBFFMPEG_FFMPEG_PATH` to specify a custom FFmpeg binary location:
+  ```bash
+  export LIBFFMPEG_FFMPEG_PATH=/usr/local/bin/ffmpeg
+  ```
+</Tip>
+
+## Error Handling
+
+```rust
+use libffmpeg::ffmpeg::{ffmpeg_slim, FfmpegError};
+
+match ffmpeg_slim(cancellation_token, |cmd| {
+    cmd.arg("-i").arg("input.mp4");
+    cmd.arg("output.mp4");
+}).await {
+    Ok(result) => {
+        println!("FFmpeg completed: {:?}", result.exit_code);
+    }
+    Err(FfmpegError::NotFound) => {
+        eprintln!("FFmpeg binary not found in PATH");
+    }
+    Err(e) => {
+        eprintln!("FFmpeg error: {}", e);
+    }
+}
+```
+
+## Implementation Details
+
+From the source code at `libffmpeg/src/ffmpeg/slim.rs:15-45`:
+
+```rust
+pub async fn ffmpeg_slim<Prepare>(
+    cancellation_token: CancellationToken,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+where
+    Prepare: FnOnce(&mut Command),
+{
+    tracing::debug!("Starting ffmpeg execution");
+
+    let ffmpeg_path = find_ffmpeg().ok_or(FfmpegError::NotFound).inspect_err(
+        |e| tracing::error!(error =% e, error_context =? e, "ffmpeg binary not found"),
+    )?;
+
+    tracing::info!(
+        ffmpeg_path = %ffmpeg_path.display(),
+        "Executing ffmpeg"
+    );
+
+    libcmd::run(ffmpeg_path, None, cancellation_token.child_token(), prepare)
+        .await
+        .inspect(|exit| {
+            tracing::debug!(exit = exit.as_value(), "ffmpeg completed");
+        })
+        .inspect_err(|e| {
+            tracing::error!(
+                error = %e,
+                "ffmpeg execution failed"
+            );
+        })
+        .map_err(Into::into)
+}
+```
+
+Key points:
+- Uses `libcmd::run` with `None` for the monitor (no output monitoring)
+- Creates a child token from the cancellation token
+- Includes built-in tracing for debugging
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Monitor Output" icon="tv" href="/guides/ffmpeg-standard">
+    Use `ffmpeg` to monitor stdout/stderr in real-time
+  </Card>
+  <Card title="Graceful Shutdown" icon="circle-stop" href="/guides/ffmpeg-graceful">
+    Use `ffmpeg_graceful` for proper file finalization
+  </Card>
+  <Card title="Progress Tracking" icon="chart-line" href="/guides/progress-parsing">
+    Parse FFmpeg progress output with PartialProgress
+  </Card>
+  <Card title="Error Handling" icon="triangle-exclamation" href="/api/errors">
+    Learn about FfmpegError types
+  </Card>
+</CardGroup>

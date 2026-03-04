@@ -1,80 +1,506 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Build your first ffmpeg transcoding application with real-time progress monitoring
 ---
 
-## Get started in three steps
+# Quickstart Guide
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+This guide walks you through building a complete video transcoding application using libffmpeg. You'll learn how to transcode videos with real-time progress monitoring and graceful cancellation.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  Make sure you've completed the [Installation](/installation) guide before starting this tutorial.
 </Note>
+
+## What You'll Build
+
+By the end of this guide, you'll have a command-line application that:
+
+- Transcodes video files using H.264 (libx264) and AAC audio
+- Displays real-time progress with percentage, fps, bitrate, and speed
+- Supports graceful cancellation via Ctrl+C
+- Extracts video duration using ffprobe
+- Uses structured progress parsing from ffmpeg output
+
+## Step-by-Step Tutorial
+
+<Steps>
+  <Step title="Create a new Rust project">
+    ```bash
+    cargo new video-transcoder
+    cd video-transcoder
+    ```
+  </Step>
+
+  <Step title="Add dependencies to Cargo.toml">
+    ```toml Cargo.toml
+    [dependencies]
+    libffmpeg = { git = "https://github.com/charliethomson/libffmpeg" }
+    tokio = { version = "1.47", features = ["rt", "process", "sync", "time", "macros"] }
+    tokio-util = { version = "0.7" }
+    anyhow = "1"
+    clap = { version = "4", features = ["derive"] }
+    humansize = "2"
+    humantime = "2"
+    ```
+
+    Don't forget to configure tracing support:
+
+    ```bash
+    mkdir -p .cargo
+    curl -o .cargo/config.toml https://raw.githubusercontent.com/charliethomson/libffmpeg/refs/heads/main/.cargo/config.toml
+    ```
+  </Step>
+
+  <Step title="Write the main application">
+    Create `src/main.rs` with a complete transcoding application:
+
+    ```rust src/main.rs
+    use std::{path::PathBuf, time::Duration};
+    use clap::Parser;
+    use libffmpeg::ffmpeg::ffmpeg;
+    use tokio_util::{future::FutureExt, sync::CancellationToken};
+
+    #[derive(Debug, Parser)]
+    struct Args {
+        /// Input video file path
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output video file path
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Optional duration limit in seconds
+        #[arg(short, long)]
+        time: Option<u64>,
+    }
+
+    #[tokio::main]
+    async fn main() -> anyhow::Result<()> {
+        let args = Args::parse();
+
+        // Create cancellation tokens
+        let root_token = CancellationToken::new();
+        let transcode_token = root_token.child_token();
+        let exit_token = root_token.child_token();
+
+        // Setup Ctrl+C handler (requires libsignal crate)
+        // For this quickstart, we'll handle cancellation manually
+        tokio::spawn({
+            let root_token = root_token.clone();
+            async move {
+                tokio::signal::ctrl_c().await.ok();
+                println!("\nReceived Ctrl+C, cancelling...");
+                root_token.cancel();
+            }
+        });
+
+        // Get video duration using ffprobe
+        println!("Analyzing input file...");
+        let video_duration = libffmpeg::util::get_duration(
+            &args.input, 
+            root_token.child_token()
+        ).await?;
+        
+        let total = args.time.unwrap_or(video_duration.as_secs()) as f64;
+        println!("Duration: {:.2}s\n", total);
+
+        // Create command monitor for stdout/stderr streaming
+        let monitor = libffmpeg::libcmd::CommandMonitor::with_capacity(100);
+
+        // Spawn progress monitoring task
+        let monitor_fut = {
+            let mut client = monitor.client.clone();
+            let exit_token = exit_token.clone();
+            tokio::spawn(async move {
+                let mut progress = libffmpeg::ffmpeg::progress::PartialProgress::default();
+
+                while let Some(Some(delivery)) = 
+                    client.recv().with_cancellation_token(&exit_token).await 
+                {
+                    match delivery {
+                        libffmpeg::libcmd::CommandMonitorMessage::Stdout { line } => {
+                            // Try to parse as progress update
+                            if !progress.with_line(&line) {
+                                println!("[stdout] {}", line);
+                                continue;
+                            }
+
+                            // Print structured progress
+                            if let Some(update) = progress.finish() {
+                                let percent = 100.0 * update.out_time.as_secs_f64() / total;
+                                println!(
+                                    "[Progress] {:.1}% | {} / {} | {} @ {:.0}fps ({:.1}x realtime)",
+                                    percent,
+                                    humantime::format_duration(update.out_time),
+                                    humantime::format_duration(Duration::from_secs_f64(total)),
+                                    humansize::format_size_i(
+                                        update.bitrate,
+                                        humansize::DECIMAL.suffix("ps")
+                                    ),
+                                    update.fps,
+                                    update.speed,
+                                );
+                            }
+                        }
+                        libffmpeg::libcmd::CommandMonitorMessage::Stderr { line } => {
+                            eprintln!("[stderr] {}", line);
+                        }
+                    }
+                }
+            })
+        };
+
+        // Run ffmpeg with monitoring
+        println!("Starting transcode...\n");
+        let result = ffmpeg(transcode_token, &monitor.server, |cmd| {
+            cmd.arg("-i").arg(&args.input);
+            cmd.arg("-t").arg(total.to_string());
+            cmd.arg("-c:v").arg("libx264");
+            cmd.arg("-preset").arg("fast");
+            cmd.arg("-crf").arg("23");
+            cmd.arg("-c:a").arg("aac");
+            cmd.arg("-b:a").arg("128k");
+            cmd.arg("-progress").arg("pipe:1");
+            cmd.arg("-y");
+            cmd.arg(&args.output);
+        }).await?;
+
+        // Stop the monitor
+        exit_token.cancel();
+        if let Err(e) = monitor_fut.await {
+            eprintln!("Failed to wait for monitor: {}", e);
+        }
+
+        // Check result
+        println!("\n");
+        if result.exit_code
+            .as_ref()
+            .map(|exit| exit.success)
+            .unwrap_or_default() 
+        {
+            println!("✓ Transcoding completed successfully!");
+            println!("Output saved to: {}", args.output.display());
+        } else {
+            println!("✗ Transcoding failed");
+            if let Some(code) = result.exit_code {
+                println!("Exit code: {:?}", code.code);
+            }
+        }
+
+        Ok(())
+    }
+    ```
+  </Step>
+
+  <Step title="Run the transcoder">
+    ```bash
+    # Basic usage
+    cargo run -- --input input.mp4 --output output.mp4
+
+    # Limit to first 30 seconds
+    cargo run -- --input input.mp4 --output output.mp4 --time 30
+    ```
+
+    Expected output:
+    ```
+    Analyzing input file...
+    Duration: 120.50s
+
+    Starting transcode...
+
+    [Progress] 5.2% | 6s 271ms / 2m 0s 500ms | 2.1 Mps @ 30fps (1.0x realtime)
+    [Progress] 12.8% | 15s 440ms / 2m 0s 500ms | 2.3 Mps @ 30fps (1.1x realtime)
+    [Progress] 25.1% | 30s 200ms / 2m 0s 500ms | 2.2 Mps @ 30fps (1.0x realtime)
+    ...
+    [Progress] 100.0% | 2m 0s 500ms / 2m 0s 500ms | 2.1 Mps @ 30fps (1.0x realtime)
+
+    ✓ Transcoding completed successfully!
+    Output saved to: output.mp4
+    ```
+  </Step>
+</Steps>
+
+## Understanding the Code
+
+Let's break down the key components:
+
+### Binary Discovery and Duration Extraction
+
+```rust
+let video_duration = libffmpeg::util::get_duration(
+    &args.input, 
+    root_token.child_token()
+).await?;
+```
+
+The `get_duration` function:
+- Automatically discovers `ffprobe` binary (via `LIBFFMPEG_FFPROBE_PATH` or PATH)
+- Runs: `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input.mp4`
+- Parses the output as `f64` seconds
+- Returns `std::time::Duration`
+
+### Command Monitor Setup
+
+```rust
+let monitor = libffmpeg::libcmd::CommandMonitor::with_capacity(100);
+```
+
+The `CommandMonitor` provides:
+- **Server** — Attached to ffmpeg process for stdout/stderr streaming
+- **Client** — Receives messages from the server in your application
+- **Capacity** — Channel buffer size (100 messages)
+
+### Progress Parsing
+
+```rust
+let mut progress = libffmpeg::ffmpeg::progress::PartialProgress::default();
+
+if !progress.with_line(&line) {
+    // Line was not a progress key=value pair
+    println!("[stdout] {}", line);
+    continue;
+}
+
+if let Some(update) = progress.finish() {
+    // Complete progress block received
+    println!("Frame: {}, Speed: {}x", update.frame, update.speed);
+}
+```
+
+`PartialProgress` accumulates lines until a complete progress block is received:
+- `with_line(&str) -> bool` — Returns `true` if line was recognized
+- `finish() -> Option<Progress>` — Returns complete progress when `progress=continue` or `progress=end` is received
+
+The `Progress` struct contains:
+- `frame: usize` — Frames processed
+- `fps: f64` — Current FPS
+- `bitrate: isize` — Bitrate in bytes/second
+- `total_size: usize` — Output size in bytes
+- `out_time: Duration` — Elapsed output time
+- `speed: f64` — Realtime multiplier (2.0 = 2x speed)
+
+### FFmpeg Execution
+
+```rust
+let result = ffmpeg(transcode_token, &monitor.server, |cmd| {
+    cmd.arg("-i").arg(&args.input);
+    cmd.arg("-progress").arg("pipe:1");  // Enable progress output to stdout
+    cmd.arg("-y");                        // Overwrite output file
+    cmd.arg(&args.output);
+}).await?;
+```
+
+The `ffmpeg` function:
+- **Signature**: `ffmpeg(CancellationToken, &CommandMonitorServer, Prepare) -> Result<CommandExit, FfmpegError>`
+- **Discovers binary** via `LIBFFMPEG_FFMPEG_PATH` or PATH
+- **Streams output** through the monitor
+- **Cancellable** via the token
+- **Returns** `CommandExit` with exit code and captured lines
+
+## Next Examples
+
+### Basic Transcode (No Monitoring)
+
+Use `ffmpeg_slim` when you don't need progress:
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg_slim;
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let result = ffmpeg_slim(token, |cmd| {
+    cmd.arg("-i").arg("input.mp4")
+       .arg("-c:v").arg("libx265")
+       .arg("-preset").arg("medium")
+       .arg("-crf").arg("28")
+       .arg("output.mp4");
+}).await?;
+
+if result.exit_code.map(|e| e.success).unwrap_or(false) {
+    println!("Success!");
+}
+```
+
+### Graceful Shutdown
+
+Use `ffmpeg_graceful` to allow ffmpeg to finalize output on cancellation:
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg_graceful;
+use libffmpeg::libcmd::CommandMonitor;
+use tokio_util::sync::CancellationToken;
+
+let monitor = CommandMonitor::with_capacity(100);
+let token = CancellationToken::new();
+
+// On cancellation, sends 'q' to stdin, waits 5 seconds, then SIGKILL
+let result = ffmpeg_graceful(
+    token, 
+    &monitor.client, 
+    &monitor.server, 
+    |cmd| {
+        cmd.arg("-i").arg("input.mp4")
+           .arg("-c:v").arg("libx264")
+           .arg("output.mp4");
+    }
+).await?;
+```
+
+<Warning>
+  Graceful shutdown sends `q` to ffmpeg's stdin and waits up to 5 seconds. If ffmpeg doesn't exit, it's killed with SIGKILL.
+</Warning>
+
+### Extract Metadata with ffprobe
+
+Use `ffprobe` directly for custom queries:
+
+```rust
+use libffmpeg::ffprobe::ffprobe;
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let result = ffprobe(token, |cmd| {
+    cmd.arg("-v").arg("quiet")
+       .arg("-print_format").arg("json")
+       .arg("-show_format")
+       .arg("-show_streams")
+       .arg("input.mp4");
+}).await?;
+
+// Parse JSON from stdout_lines
+let json = result.stdout_lines.join("\n");
+println!("{}", json);
+```
+
+## Common Patterns
+
+### Timeout for Long Operations
+
+```rust
+use tokio::time::{timeout, Duration};
+
+let token = CancellationToken::new();
+
+let result = timeout(
+    Duration::from_secs(300), // 5 minute timeout
+    ffmpeg_slim(token.clone(), |cmd| {
+        cmd.arg("-i").arg("input.mp4")
+           .arg("output.mp4");
+    })
+).await??;
+```
+
+### Multiple Concurrent Transcodes
+
+```rust
+use futures::future::try_join_all;
+
+let tasks: Vec<_> = inputs.iter().map(|input| {
+    let token = CancellationToken::new();
+    async move {
+        ffmpeg_slim(token, |cmd| {
+            cmd.arg("-i").arg(input)
+               .arg(format!("{}.transcoded.mp4", input));
+        }).await
+    }
+}).collect();
+
+let results = try_join_all(tasks).await?;
+```
+
+### Custom Progress Display
+
+```rust
+use indicatif::{ProgressBar, ProgressStyle};
+
+let bar = ProgressBar::new(100);
+bar.set_style(
+    ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}% {msg}")
+        .unwrap()
+);
+
+while let Some(Some(delivery)) = client.recv().await {
+    if let libffmpeg::libcmd::CommandMonitorMessage::Stdout { line } = delivery {
+        if progress.with_line(&line) {
+            if let Some(update) = progress.finish() {
+                let percent = (100.0 * update.out_time.as_secs_f64() / total) as u64;
+                bar.set_position(percent);
+                bar.set_message(format!("{}fps @ {:.1}x", update.fps, update.speed));
+            }
+        }
+    }
+}
+
+bar.finish_with_message("Done!");
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="No progress output from ffmpeg">
+    **Problem**: Progress not appearing even with `-progress pipe:1`.
+    
+    **Solution**: Ensure you're using the `ffmpeg` or `ffmpeg_graceful` function (not `ffmpeg_slim`) and passing the `CommandMonitorServer`.
+  </Accordion>
+
+  <Accordion title="Transcoding very slow">
+    **Problem**: Encoding at 0.1x realtime speed.
+    
+    **Solution**: 
+    - Try faster preset: `-preset ultrafast`
+    - Use hardware acceleration: `-c:v h264_videotoolbox` (macOS) or `-c:v h264_nvenc` (NVIDIA)
+    - Reduce quality: increase `-crf` value (e.g., 28)
+  </Accordion>
+
+  <Accordion title="Output file incomplete after cancellation">
+    **Problem**: File corrupted when cancelled with Ctrl+C.
+    
+    **Solution**: Use `ffmpeg_graceful` instead of `ffmpeg`. It sends `q` to stdin allowing ffmpeg to finalize the file.
+  </Accordion>
+
+  <Accordion title="Duration extraction fails">
+    **Problem**: `get_duration` returns error.
+    
+    **Solution**: 
+    - Verify file exists and is readable
+    - Check file is a valid media file
+    - Ensure ffprobe is installed (`which ffprobe`)
+  </Accordion>
+</AccordionGroup>
+
+## Full Example Source
+
+The complete example (with signal handling) is available in the libffmpeg repository:
+
+```bash
+# Clone the repository
+git clone https://github.com/charliethomson/libffmpeg
+cd libffmpeg
+
+# Run the example
+cargo run --example transcode_with_progress -- --input input.mp4 --output output.mp4
+```
+
+Source: [libffmpeg/examples/transcode_with_progress.rs](https://github.com/charliethomson/libffmpeg/blob/main/libffmpeg/examples/transcode_with_progress.rs)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="API Reference" icon="book">
+    Explore detailed type signatures and all available functions
+  </Card>
+  
+  <Card title="Examples" icon="code">
+    Browse more examples including audio extraction, thumbnail generation, and streaming
+  </Card>
+  
+  <Card title="Advanced Usage" icon="wand-magic-sparkles">
+    Learn about custom error handling, tracing integration, and performance optimization
+  </Card>
+  
+  <Card title="GitHub Repository" icon="github" href="https://github.com/charliethomson/libffmpeg">
+    View source code, report issues, and contribute
+  </Card>
+</CardGroup>

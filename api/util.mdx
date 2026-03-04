@@ -1,0 +1,158 @@
+---
+title: "util"
+description: "Utility functions for media file operations"
+---
+
+The `util` module provides utility functions for common media file operations.
+
+## get_duration
+
+Extract the duration of a media file using ffprobe.
+
+Runs ffprobe in quiet mode and parses the `format=duration` entry from the output. Returns the duration as a `std::time::Duration`.
+
+```rust
+pub async fn get_duration<P: AsRef<Path>>(
+    input: P,
+    cancellation_token: CancellationToken,
+) -> Result<Duration, DurationError>
+```
+
+### Parameters
+
+<ParamField path="input" type="P: AsRef<Path>" required>
+  The path to the media file. Can be any type that implements `AsRef<Path>`, such as `&str`, `String`, `Path`, or `PathBuf`.
+</ParamField>
+
+<ParamField path="cancellation_token" type="CancellationToken" required>
+  A token to cancel the ffprobe operation. When cancelled, the process is killed immediately.
+</ParamField>
+
+### Returns
+
+Returns `Result<Duration, DurationError>`:
+- `Ok(Duration)` - The duration of the media file as a `std::time::Duration`
+- `Err(DurationError)` - An error occurred during execution or parsing
+
+### Error Cases
+
+<ParamField path="DurationError::Ffprobe" type="FfprobeError">
+  The underlying ffprobe execution failed (e.g., binary not found).
+</ParamField>
+
+<ParamField path="DurationError::IncompleteSubprocess" type="{ result: CommandExit }">
+  The process returned but no exit status was present. This indicates an unexpected termination.
+</ParamField>
+
+<ParamField path="DurationError::ExitedUnsuccessfully" type="{ exit_code: CommandExitCode }">
+  ffprobe exited with a non-zero exit code, indicating the operation failed.
+</ParamField>
+
+<ParamField path="DurationError::ExpectedLine" type="{ result: CommandExit }">
+  Expected ffprobe to output a line with the duration, but no output was received.
+</ParamField>
+
+<ParamField path="DurationError::Parse" type="{ inner_error: AnyError }">
+  Failed to parse the duration string provided by ffprobe into a valid f64 number.
+</ParamField>
+
+### Implementation Details
+
+The function executes ffprobe with the following arguments:
+- `-threads 4` - Use 4 threads for processing
+- `-v quiet` - Suppress all output except errors
+- `-show_entries format=duration` - Only show the duration field from the format section
+- `-of default=noprint_wrappers=1:nokey=1` - Output only the value without key names or wrappers
+
+The output is parsed as a floating-point number representing seconds, which is then converted to a `std::time::Duration`.
+
+### Example
+
+```rust
+use libffmpeg::get_duration;
+use tokio_util::sync::CancellationToken;
+use std::time::Duration;
+
+let token = CancellationToken::new();
+let duration = get_duration("video.mp4", token).await?;
+
+println!("Duration: {:?}", duration);
+println!("Duration in seconds: {}", duration.as_secs());
+println!("Duration in milliseconds: {}", duration.as_millis());
+```
+
+### Example with Path Types
+
+```rust
+use libffmpeg::get_duration;
+use tokio_util::sync::CancellationToken;
+use std::path::{Path, PathBuf};
+
+let token = CancellationToken::new();
+
+// Works with &str
+let duration = get_duration("video.mp4", token.clone()).await?;
+
+// Works with String
+let path = String::from("video.mp4");
+let duration = get_duration(path, token.clone()).await?;
+
+// Works with Path
+let path = Path::new("video.mp4");
+let duration = get_duration(path, token.clone()).await?;
+
+// Works with PathBuf
+let path = PathBuf::from("video.mp4");
+let duration = get_duration(path, token.clone()).await?;
+```
+
+### Example with Error Handling
+
+```rust
+use libffmpeg::{get_duration, DurationError};
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+match get_duration("video.mp4", token).await {
+    Ok(duration) => {
+        println!("Video duration: {:.2} seconds", duration.as_secs_f64());
+    }
+    Err(DurationError::Ffprobe { inner_error }) => {
+        eprintln!("ffprobe error: {}", inner_error);
+    }
+    Err(DurationError::ExitedUnsuccessfully { exit_code }) => {
+        eprintln!("ffprobe failed with exit code: {:?}", exit_code);
+    }
+    Err(DurationError::Parse { inner_error }) => {
+        eprintln!("Failed to parse duration: {}", inner_error);
+    }
+    Err(e) => {
+        eprintln!("Unexpected error: {}", e);
+    }
+}
+```
+
+### Example with Cancellation
+
+```rust
+use libffmpeg::get_duration;
+use tokio_util::sync::CancellationToken;
+use tokio::time::{timeout, Duration};
+
+let token = CancellationToken::new();
+
+// Clone the token for the timeout handler
+let token_clone = token.clone();
+
+// Cancel after 5 seconds
+tokio::spawn(async move {
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    token_clone.cancel();
+});
+
+// This will be cancelled if it takes more than 5 seconds
+match get_duration("very_large_video.mp4", token).await {
+    Ok(duration) => println!("Duration: {:?}", duration),
+    Err(e) => eprintln!("Operation cancelled or failed: {}", e),
+}
+```

@@ -1,0 +1,405 @@
+---
+title: "Using ffmpeg_graceful"
+description: "Learn how to use ffmpeg_graceful for proper file finalization with graceful shutdown"
+---
+
+## Overview
+
+The `ffmpeg_graceful` function runs FFmpeg with both output monitoring and graceful shutdown support. On cancellation, it sends `q` (FFmpeg's built-in quit command) to stdin, giving the process up to 5 seconds to exit cleanly before falling back to SIGKILL. This ensures FFmpeg can properly finalize output files.
+
+## When to Use ffmpeg_graceful
+
+Use `ffmpeg_graceful` when:
+
+- Output file integrity is critical
+- You need FFmpeg to properly finalize file headers (e.g., MP4 moov atom)
+- You want to allow graceful cancellation during encoding
+- You're creating files that need valid metadata on interruption
+
+For simple monitoring without graceful shutdown, use [`ffmpeg`](/guides/ffmpeg-standard). For minimal overhead without monitoring, use [`ffmpeg_slim`](/guides/ffmpeg-slim).
+
+## Why Graceful Shutdown Matters
+
+When FFmpeg is killed abruptly (SIGKILL), output files may be:
+- Missing file headers (moov atom in MP4)
+- Lacking proper index information
+- Unplayable in media players
+- Missing duration metadata
+
+Graceful shutdown via the `q` command allows FFmpeg to:
+- Write file headers and trailers
+- Finalize index information
+- Complete the current GOP (Group of Pictures)
+- Close files properly
+
+## Function Signature
+
+```rust
+pub async fn ffmpeg_graceful<Prepare>(
+    cancellation_token: CancellationToken,
+    client: &CommandMonitorClient,
+    server: &CommandMonitorServer,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+where
+    Prepare: FnOnce(&mut Command),
+```
+
+## Parameters
+
+<ParamField path="cancellation_token" type="CancellationToken" required>
+  Token that triggers graceful shutdown when cancelled
+</ParamField>
+
+<ParamField path="client" type="&CommandMonitorClient" required>
+  Client for sending stdin commands (used to send "q")
+</ParamField>
+
+<ParamField path="server" type="&CommandMonitorServer" required>
+  Server for receiving stdout/stderr output lines
+</ParamField>
+
+<ParamField path="prepare" type="FnOnce(&mut Command)" required>
+  Closure that configures the FFmpeg command
+</ParamField>
+
+## Return Value
+
+Returns `Result<CommandExit, FfmpegError>` where:
+- `CommandExit` contains the exit code and captured output
+- `FfmpegError::NotFound` if FFmpeg binary cannot be located
+
+## Basic Usage
+
+<Steps>
+  <Step title="Create a CommandMonitor">
+    Create both client and server for bidirectional communication:
+
+    ```rust
+    use libffmpeg::libcmd::CommandMonitor;
+
+    let monitor = CommandMonitor::with_capacity(100);
+    ```
+  </Step>
+
+  <Step title="Set up output monitoring">
+    Spawn a task to process FFmpeg output:
+
+    ```rust
+    let mut output_client = monitor.client.clone();
+    let monitor_task = tokio::spawn(async move {
+        while let Some(Some(msg)) = output_client.recv().await {
+            match msg {
+                CommandMonitorMessage::Stdout { line } => println!("[OUT] {}", line),
+                CommandMonitorMessage::Stderr { line } => eprintln!("[ERR] {}", line),
+            }
+        }
+    });
+    ```
+  </Step>
+
+  <Step title="Run FFmpeg with graceful shutdown">
+    Execute FFmpeg with both client and server:
+
+    ```rust
+    use libffmpeg::ffmpeg::ffmpeg_graceful;
+
+    let result = ffmpeg_graceful(
+        cancellation_token,
+        &monitor.client,
+        &monitor.server,
+        |cmd| {
+            cmd.arg("-i").arg("input.mp4");
+            cmd.arg("-c:v").arg("libx264");
+            cmd.arg("output.mp4");
+        }
+    ).await?;
+    ```
+  </Step>
+
+  <Step title="Wait for completion">
+    Ensure monitoring task finishes:
+
+    ```rust
+    monitor_task.await?;
+    ```
+  </Step>
+</Steps>
+
+## Complete Example
+
+```rust
+use std::{path::PathBuf, time::Duration};
+use libffmpeg::ffmpeg::ffmpeg_graceful;
+use libffmpeg::libcmd::{CommandMonitor, CommandMonitorMessage};
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let input = PathBuf::from("input.mp4");
+    let output = PathBuf::from("output.mp4");
+    
+    // Create tokens
+    let root_token = CancellationToken::new();
+    let transcode_token = root_token.child_token();
+    let monitor_token = root_token.child_token();
+    
+    // Set up signal handling for graceful shutdown
+    let signal_token = root_token.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        println!("\nReceived Ctrl+C, shutting down gracefully...");
+        signal_token.cancel();
+    });
+    
+    // Create monitor
+    let monitor = CommandMonitor::with_capacity(100);
+    
+    // Spawn output monitoring
+    let monitor_task = {
+        let mut client = monitor.client.clone();
+        let monitor_token = monitor_token.clone();
+        
+        tokio::spawn(async move {
+            while let Some(Some(msg)) = client.recv().await {
+                if monitor_token.is_cancelled() {
+                    break;
+                }
+                
+                match msg {
+                    CommandMonitorMessage::Stdout { line } => {
+                        println!("[OUT] {}", line);
+                    }
+                    CommandMonitorMessage::Stderr { line } => {
+                        eprintln!("[ERR] {}", line);
+                    }
+                }
+            }
+        })
+    };
+    
+    // Run FFmpeg with graceful shutdown
+    let result = ffmpeg_graceful(
+        transcode_token,
+        &monitor.client,
+        &monitor.server,
+        |cmd| {
+            cmd.arg("-i").arg(&input);
+            cmd.arg("-c:v").arg("libx264");
+            cmd.arg("-preset").arg("medium");
+            cmd.arg("-crf").arg("23");
+            cmd.arg("-c:a").arg("aac");
+            cmd.arg("-b:a").arg("128k");
+            cmd.arg("-movflags").arg("+faststart"); // Enable streaming
+            cmd.arg("-y"); // Overwrite output
+            cmd.arg(&output);
+        }
+    ).await?;
+    
+    // Stop monitoring
+    monitor_token.cancel();
+    monitor_task.await?;
+    
+    // Check result
+    if result.exit_code.as_ref().map(|e| e.success).unwrap_or(false) {
+        println!("Transcoding completed successfully!");
+    } else {
+        println!("Transcoding was cancelled or failed, but output file is valid.");
+    }
+    
+    Ok(())
+}
+```
+
+## Graceful Shutdown Flow
+
+From the source code at `libffmpeg/src/ffmpeg/graceful.rs:45-88`, here's how graceful shutdown works:
+
+<Steps>
+  <Step title="Process starts normally">
+    FFmpeg begins execution with a separate process token:
+
+    ```rust
+    // Different token for the process
+    let process_token = CancellationToken::new();
+    let exit_token = CancellationToken::new();
+    ```
+  </Step>
+
+  <Step title="User requests cancellation">
+    When the main cancellation token is triggered, the shutdown handler activates.
+  </Step>
+
+  <Step title="Send quit command">
+    The handler sends `q` to FFmpeg's stdin:
+
+    ```rust
+    // Send quit command
+    client.send("q").await;
+    ```
+  </Step>
+
+  <Step title="Wait with timeout">
+    Give FFmpeg up to 5 seconds to exit cleanly:
+
+    ```rust
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        exit_token.cancelled()
+    ).await {
+        Ok(()) => {
+            // Process exited cleanly
+        }
+        Err(_timeout) => {
+            // Timeout: force kill
+            tracing::warn!(
+                "ffmpeg process did not respond to quit command, sending SIGKILL"
+            );
+            process_token.cancel();
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Fallback to SIGKILL">
+    If FFmpeg doesn't exit within 5 seconds, it's killed forcefully.
+  </Step>
+</Steps>
+
+## Timeout Configuration
+
+The default graceful shutdown timeout is 5 seconds. This is hardcoded in the implementation:
+
+```rust
+tokio::time::timeout(Duration::from_secs(5), exit_token.cancelled()).await
+```
+
+This timeout is generally sufficient for FFmpeg to:
+- Finish encoding the current frame
+- Write file headers and trailers
+- Close file handles
+
+<Note>
+  The 5-second timeout is not configurable in the current API. If you need a different timeout, consider forking the function or using the standard `ffmpeg` function with manual shutdown logic.
+</Note>
+
+## Example: Graceful Shutdown on Signal
+
+```rust
+use tokio::signal;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let root_token = CancellationToken::new();
+    
+    // Handle SIGTERM and SIGINT
+    let signal_token = root_token.clone();
+    tokio::spawn(async move {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
+        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+            .expect("Failed to install SIGINT handler");
+        
+        tokio::select! {
+            _ = sigterm.recv() => println!("Received SIGTERM"),
+            _ = sigint.recv() => println!("Received SIGINT"),
+        }
+        
+        println!("Initiating graceful shutdown...");
+        signal_token.cancel();
+    });
+    
+    let monitor = CommandMonitor::with_capacity(100);
+    
+    // Run with graceful shutdown
+    let result = ffmpeg_graceful(
+        root_token.child_token(),
+        &monitor.client,
+        &monitor.server,
+        |cmd| {
+            cmd.arg("-i").arg("input.mp4");
+            cmd.arg("output.mp4");
+        }
+    ).await?;
+    
+    println!("Shutdown complete");
+    Ok(())
+}
+```
+
+## Implementation Details
+
+From `libffmpeg/src/ffmpeg/graceful.rs:11-115`, the function creates a background task that monitors for cancellation:
+
+```rust
+let shutdown_handle = {
+    let span = tracing::info_span!(parent: span, "ffmpeg_graceful::shutdown_handle");
+    let client = client.clone();
+    let process_token = process_token.clone();
+    let exit_token = exit_token.clone();
+    let kill_token = cancellation_token.child_token();
+    
+    tokio::spawn(async move {
+        // Wait for kill token or exit
+        tokio::select! {
+            () = exit_token.cancelled() => {
+                // Process exited naturally
+                return
+            },
+            () = kill_token.cancelled() => {
+                // Continue with shutdown
+            }
+        }
+        
+        // Send quit
+        client.send("q").await;
+        
+        // Wait with timeout
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            exit_token.cancelled()
+        ).await {
+            Ok(()) => {}
+            Err(_timeout) => {
+                tracing::warn!(
+                    "ffmpeg process did not respond to quit command, sending SIGKILL"
+                );
+                process_token.cancel();
+            }
+        }
+    }.instrument(span))
+};
+```
+
+<Tip>
+  The graceful shutdown mechanism uses FFmpeg's built-in `-stdin` support. If you disable stdin (e.g., with `-nostdin`), graceful shutdown won't work, and the process will be killed immediately.
+</Tip>
+
+## Comparison with Other Functions
+
+| Feature | ffmpeg_slim | ffmpeg | ffmpeg_graceful |
+|---------|-------------|--------|----------------|
+| Output monitoring | No | Yes | Yes |
+| Graceful shutdown | No | No | Yes |
+| Stdin support | No | No | Yes |
+| Overhead | Minimal | Low | Moderate |
+| File integrity on cancel | Poor | Poor | Good |
+| Best for | Simple tasks | Progress tracking | Production use |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Progress Parsing" icon="chart-line" href="/guides/progress-parsing">
+    Parse progress output for user feedback
+  </Card>
+  <Card title="Standard Monitoring" icon="tv" href="/guides/ffmpeg-standard">
+    Use ffmpeg for simpler monitoring needs
+  </Card>
+  <Card title="Duration Extraction" icon="clock" href="/guides/duration-extraction">
+    Get video duration for progress calculation
+  </Card>
+  <Card title="Error Handling" icon="triangle-exclamation" href="/api/errors">
+    Handle FfmpegError types properly
+  </Card>
+</CardGroup>

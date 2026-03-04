@@ -1,0 +1,129 @@
+---
+title: "Basic Transcode"
+description: "Simple video transcoding example using libffmpeg"
+---
+
+This example demonstrates the simplest way to transcode a video file using libffmpeg. It uses the `ffmpeg_slim` function, which provides basic cancellation support without output monitoring.
+
+## Complete Example
+
+```rust
+use std::path::PathBuf;
+use libffmpeg::ffmpeg::ffmpeg_slim;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let input = PathBuf::from("input.mp4");
+    let output = PathBuf::from("output.mp4");
+    
+    // Create cancellation token for graceful shutdown
+    let cancellation_token = CancellationToken::new();
+    
+    // Run ffmpeg with basic transcoding settings
+    let result = ffmpeg_slim(cancellation_token, |cmd| {
+        cmd.arg("-i").arg(&input);
+        cmd.arg("-c:v").arg("libx264");
+        cmd.arg("-preset").arg("fast");
+        cmd.arg("-crf").arg("23");
+        cmd.arg("-c:a").arg("aac");
+        cmd.arg("-b:a").arg("128k");
+        cmd.arg("-y"); // Overwrite output file
+        cmd.arg(&output);
+    })
+    .await?;
+    
+    // Check if transcoding was successful
+    if result.exit_code.as_ref().map(|e| e.success).unwrap_or_default() {
+        println!("Transcoding completed successfully!");
+    } else {
+        eprintln!("Transcoding failed: {:#?}", result);
+    }
+    
+    Ok(())
+}
+```
+
+## Breaking Down the Code
+
+### 1. Import Dependencies
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg_slim;
+use tokio_util::sync::CancellationToken;
+```
+
+- **`ffmpeg_slim`**: The lightest-weight variant of the ffmpeg runner. It spawns ffmpeg, waits for completion, and returns the exit result without output monitoring.
+- **`CancellationToken`**: Allows you to cancel the operation if needed (e.g., on user interrupt or timeout).
+
+### 2. Create Cancellation Token
+
+```rust
+let cancellation_token = CancellationToken::new();
+```
+
+The cancellation token enables you to abort the transcoding operation. If you call `cancellation_token.cancel()`, ffmpeg will be terminated. This is useful for:
+- Handling Ctrl+C signals
+- Implementing timeouts
+- Responding to user cancellation requests
+
+### 3. Configure FFmpeg Command
+
+```rust
+ffmpeg_slim(cancellation_token, |cmd| {
+    cmd.arg("-i").arg(&input);
+    cmd.arg("-c:v").arg("libx264");
+    // ... more arguments
+})
+```
+
+The closure receives a `&mut Command` that you configure with ffmpeg arguments:
+
+- **`-i input.mp4`**: Specifies the input file
+- **`-c:v libx264`**: Use H.264 video codec
+- **`-preset fast`**: Balance between encoding speed and compression
+- **`-crf 23`**: Constant Rate Factor (quality level, 18-28 is typical)
+- **`-c:a aac`**: Use AAC audio codec
+- **`-b:a 128k`**: Set audio bitrate to 128 kbps
+- **`-y`**: Overwrite output file without prompting
+
+### 4. Check the Result
+
+```rust
+if result.exit_code.as_ref().map(|e| e.success).unwrap_or_default() {
+    println!("Transcoding completed successfully!");
+}
+```
+
+The `CommandExit` result contains:
+- **`exit_code`**: The process exit status
+- **`success`**: Whether the exit code indicates success (typically 0)
+
+## When to Use `ffmpeg_slim`
+
+Use this variant when:
+- You don't need real-time progress updates
+- You don't need to monitor stdout/stderr output
+- You want the minimal overhead
+- You still want cancellation support
+
+For progress monitoring, see the [Progress Monitoring](/examples/progress-monitoring) example.
+
+For graceful shutdown that allows ffmpeg to finalize output properly, see the [Graceful Shutdown](/examples/graceful-shutdown) example.
+
+## Adding Signal Handling
+
+To handle Ctrl+C gracefully:
+
+```rust
+use libsignal::cancel_after_signal;
+
+let cancellation_token = CancellationToken::new();
+cancel_after_signal(cancellation_token.clone());
+
+let result = ffmpeg_slim(cancellation_token, |cmd| {
+    // ... configure command
+}).await?;
+```
+
+When the user presses Ctrl+C, the cancellation token will be triggered, and ffmpeg will be terminated.

@@ -1,0 +1,377 @@
+---
+title: "Graceful Shutdown"
+description: "Properly cancel FFmpeg operations with output finalization"
+---
+
+This example demonstrates how to gracefully shutdown FFmpeg operations, allowing the process to finalize the output file properly before terminating. This is crucial for producing valid, playable media files even when cancelled.
+
+## Why Graceful Shutdown Matters
+
+When you cancel a running FFmpeg process, you have two options:
+
+1. **Immediate kill (SIGKILL)**: The process terminates instantly, but the output file may be corrupted or unplayable because headers weren't finalized.
+
+2. **Graceful shutdown**: Send FFmpeg the `q` command via stdin, allowing it to:
+   - Flush buffers
+   - Write final metadata
+   - Properly close the output file
+   - Produce a valid, playable file up to the point of cancellation
+
+The `ffmpeg_graceful()` function implements the second approach with a fallback: it sends the quit command and waits up to 5 seconds for clean exit, then falls back to SIGKILL if needed.
+
+## Complete Example
+
+```rust
+use std::path::PathBuf;
+use libffmpeg::ffmpeg::ffmpeg_graceful;
+use libffmpeg::libcmd::CommandMonitor;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let input = PathBuf::from("input.mp4");
+    let output = PathBuf::from("output.mp4");
+    
+    // Create cancellation token
+    let cancellation_token = CancellationToken::new();
+    
+    // Setup signal handling for Ctrl+C
+    libsignal::cancel_after_signal(cancellation_token.clone());
+    
+    // Create monitor for output capture
+    let monitor = CommandMonitor::with_capacity(100);
+    
+    // Spawn task to handle output
+    let monitor_task = {
+        let mut client = monitor.client.clone();
+        tokio::spawn(async move {
+            while let Some(Some(msg)) = client.recv().await {
+                match msg {
+                    libffmpeg::libcmd::CommandMonitorMessage::Stdout { line } => {
+                        println!("[OUT] {}", line);
+                    }
+                    libffmpeg::libcmd::CommandMonitorMessage::Stderr { line } => {
+                        eprintln!("[ERR] {}", line);
+                    }
+                }
+            }
+        })
+    };
+    
+    println!("Starting transcode. Press Ctrl+C to cancel gracefully...");
+    
+    // Run with graceful shutdown
+    let result = ffmpeg_graceful(
+        cancellation_token,
+        &monitor.client,
+        &monitor.server,
+        |cmd| {
+            cmd.arg("-i").arg(&input);
+            cmd.arg("-c:v").arg("libx264");
+            cmd.arg("-preset").arg("medium");
+            cmd.arg("-crf").arg("23");
+            cmd.arg("-c:a").arg("aac");
+            cmd.arg("-b:a").arg("128k");
+            cmd.arg("-y");
+            cmd.arg(&output);
+        },
+    )
+    .await?;
+    
+    // Wait for monitor task to finish
+    let _ = monitor_task.await;
+    
+    if result.exit_code.as_ref().map(|e| e.success).unwrap_or_default() {
+        println!("Transcoding completed successfully!");
+    } else {
+        println!("Transcoding was cancelled or failed.");
+        println!("Output file is valid up to the point of cancellation.");
+    }
+    
+    Ok(())
+}
+```
+
+## How It Works
+
+Let's look at the implementation of `ffmpeg_graceful()` from the libffmpeg source:
+
+```rust
+pub async fn ffmpeg_graceful<Prepare>(
+    cancellation_token: CancellationToken,
+    client: &CommandMonitorClient,
+    server: &CommandMonitorServer,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+where
+    Prepare: FnOnce(&mut Command),
+{
+    // Find ffmpeg binary
+    let ffmpeg_path = find_ffmpeg().ok_or(FfmpegError::NotFound)?;
+    
+    // Create separate token for the process
+    let process_token = CancellationToken::new();
+    
+    // Token cancelled after process exits
+    let exit_token = CancellationToken::new();
+    
+    // Spawn shutdown handler
+    let shutdown_handle = {
+        let client = client.clone();
+        let process_token = process_token.clone();
+        let exit_token = exit_token.clone();
+        let kill_token = cancellation_token.child_token();
+        
+        tokio::spawn(async move {
+            // Wait for cancellation request or process exit
+            tokio::select! {
+                () = exit_token.cancelled() => {
+                    // Process exited naturally, nothing to do
+                    return
+                },
+                () = kill_token.cancelled() => {
+                    // User requested cancellation, continue
+                }
+            }
+            
+            // Send 'q' command to ffmpeg's stdin
+            client.send("q").await;
+            
+            // Wait up to 5 seconds for graceful exit
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                exit_token.cancelled()
+            ).await {
+                Ok(()) => {
+                    // Process exited gracefully
+                }
+                Err(_timeout) => {
+                    // Timeout: force kill
+                    tracing::warn!(
+                        "ffmpeg did not respond to quit command, sending SIGKILL"
+                    );
+                    process_token.cancel();
+                }
+            }
+        })
+    };
+    
+    // Run ffmpeg
+    let result = libcmd::run(
+        ffmpeg_path,
+        Some(server.clone()),
+        process_token.child_token(),
+        prepare,
+    )
+    .await?;
+    
+    // Signal that process has exited
+    exit_token.cancel();
+    
+    // Wait for shutdown handler to complete
+    let _ = shutdown_handle.await;
+    
+    result
+}
+```
+
+## The Shutdown Flow
+
+When you cancel a `ffmpeg_graceful()` operation, here's what happens:
+
+1. **User triggers cancellation** (e.g., presses Ctrl+C)
+   ```rust
+   cancellation_token.cancel();
+   ```
+
+2. **Shutdown handler wakes up** and sends the quit command
+   ```rust
+   client.send("q").await;
+   ```
+
+3. **FFmpeg receives 'q' on stdin** and begins graceful shutdown:
+   - Stops reading input
+   - Flushes encoder buffers
+   - Writes file trailer/metadata
+   - Closes output file
+   - Exits with status code
+
+4. **Two possible outcomes:**
+
+   a. **Success** (within 5 seconds):
+      - FFmpeg exits cleanly
+      - `exit_token` is cancelled
+      - Output file is properly finalized
+   
+   b. **Timeout** (after 5 seconds):
+      - `process_token.cancel()` is called
+      - SIGKILL sent to FFmpeg
+      - Process terminates immediately
+      - Output file may be incomplete
+
+## Key Differences from Standard `ffmpeg()`
+
+| Feature | `ffmpeg()` | `ffmpeg_graceful()` |
+|---------|-----------|-------------------|
+| **Cancellation** | Immediate SIGKILL | Sends 'q', waits 5s, then SIGKILL |
+| **Output finalization** | No guarantee | Output finalized if process responds |
+| **Cancellation latency** | Instant | Up to 5 seconds |
+| **Output validity** | May be corrupted | Valid up to cancellation point |
+
+## Using with Progress Monitoring
+
+You can combine graceful shutdown with progress monitoring:
+
+```rust
+use libffmpeg::ffmpeg::progress::PartialProgress;
+use tokio_util::future::FutureExt;
+
+let monitor = CommandMonitor::with_capacity(100);
+let mut client = monitor.client.clone();
+
+let monitor_task = tokio::spawn(async move {
+    let mut progress = PartialProgress::default();
+    
+    while let Some(Some(msg)) = client.recv().await {
+        match msg {
+            CommandMonitorMessage::Stdout { line } => {
+                if progress.with_line(&line) {
+                    if let Some(update) = progress.finish() {
+                        println!(
+                            "Progress: {:.1}% @ {}x speed",
+                            update.out_time.as_secs_f64() / total * 100.0,
+                            update.speed
+                        );
+                    }
+                }
+            }
+            CommandMonitorMessage::Stderr { line } => {
+                eprintln!("[ERR] {}", line);
+            }
+        }
+    }
+});
+
+let result = ffmpeg_graceful(
+    cancellation_token,
+    &monitor.client,
+    &monitor.server,
+    |cmd| {
+        cmd.arg("-i").arg(input);
+        cmd.arg("-progress").arg("pipe:1");
+        // ... other args
+        cmd.arg(output);
+    }
+).await?;
+
+monitor_task.await?;
+```
+
+## Cancellation Token Hierarchy
+
+A common pattern is to use child tokens for different parts of the operation:
+
+```rust
+let root_token = CancellationToken::new();
+let transcode_token = root_token.child_token();
+let monitor_token = root_token.child_token();
+
+// Handle Ctrl+C
+libsignal::cancel_after_signal(root_token.clone());
+
+// Start monitoring
+let monitor_task = tokio::spawn(async move {
+    tokio::select! {
+        () = monitor_token.cancelled() => {
+            // Cleanup
+        }
+        _ = async {
+            // Monitoring logic
+        } => {}
+    }
+});
+
+// Run ffmpeg
+let result = ffmpeg_graceful(
+    transcode_token,
+    &monitor.client,
+    &monitor.server,
+    |cmd| { /* ... */ }
+).await?;
+
+// Cancel monitoring
+monitor_token.cancel();
+monitor_task.await?;
+```
+
+When `root_token.cancel()` is called:
+- Both `transcode_token` and `monitor_token` are automatically cancelled
+- FFmpeg begins graceful shutdown
+- Monitor task stops receiving messages
+- Everything cleans up in order
+
+## Testing Graceful Shutdown
+
+To test that graceful shutdown is working:
+
+```bash
+# Start a long transcode
+cargo run --example graceful_shutdown_example
+
+# After a few seconds, press Ctrl+C
+
+# Check that output file is valid:
+ffprobe output.mp4
+
+# Should show valid metadata and be playable
+ffplay output.mp4
+```
+
+Compare this to immediate kill:
+```bash
+# Start transcode
+ffmpeg -i input.mp4 output_killed.mp4 &
+PID=$!
+
+# Kill immediately
+kill -9 $PID
+
+# Output is often corrupted
+ffprobe output_killed.mp4  # May show errors
+```
+
+## When to Use Each Function
+
+- **`ffmpeg_slim()`**: Quick operations where cancellation isn't expected or output validity doesn't matter
+- **`ffmpeg()`**: When you need progress monitoring but not graceful shutdown (e.g., short operations)
+- **`ffmpeg_graceful()`**: Long-running operations where cancelled output should still be valid and playable
+
+## Best Practices
+
+1. **Always use graceful shutdown for user-facing applications** where Ctrl+C cancellation is expected
+
+2. **Set reasonable timeouts** if 5 seconds is too long for your use case:
+   ```rust
+   // You would need to implement a custom version with configurable timeout
+   ```
+
+3. **Handle both success and cancellation** in your UI:
+   ```rust
+   match result.exit_code {
+       Some(exit) if exit.success => {
+           println!("Completed successfully!");
+       }
+       _ => {
+           println!("Cancelled - partial output saved");
+       }
+   }
+   ```
+
+4. **Test cancellation behavior** to ensure output files are valid
+
+5. **Combine with progress monitoring** to give users feedback during long operations
+
+## See Also
+
+- [Basic Transcode](/examples/basic-transcode) - Simple transcoding without graceful shutdown
+- [Progress Monitoring](/examples/progress-monitoring) - Real-time progress tracking

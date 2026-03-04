@@ -1,0 +1,418 @@
+---
+title: "Using ffprobe"
+description: "Learn how to use the ffprobe function to extract media file information"
+---
+
+## Overview
+
+The `ffprobe` function executes FFprobe to analyze media files and extract information like format, duration, codec details, streams, and metadata. It provides a flexible interface for configuring FFprobe arguments and captures the complete output for parsing.
+
+## When to Use ffprobe
+
+Use the `ffprobe` function when you need to:
+
+- Extract media file metadata (duration, bitrate, codec, etc.)
+- Analyze video/audio streams
+- Validate media file integrity
+- Get format-specific information
+- Check file properties before processing
+
+For specifically extracting duration, consider the higher-level [`get_duration`](/guides/duration-extraction) utility function.
+
+## Function Signature
+
+```rust
+pub async fn ffprobe<Prepare>(
+    cancellation_token: CancellationToken,
+    prepare: Prepare,
+) -> Result<CommandExit, FfprobeError>
+where
+    Prepare: FnOnce(&mut Command),
+```
+
+## Parameters
+
+<ParamField path="cancellation_token" type="CancellationToken" required>
+  A tokio cancellation token for stopping the ffprobe process if needed
+</ParamField>
+
+<ParamField path="prepare" type="FnOnce(&mut Command)" required>
+  A closure that configures the ffprobe command with arguments
+</ParamField>
+
+## Return Value
+
+Returns `Result<CommandExit, FfprobeError>` where:
+- `CommandExit` contains:
+  - `exit_code`: The process exit code
+  - `stdout_lines`: Captured stdout lines (typically JSON or text output)
+  - `stderr_lines`: Captured stderr lines (log messages)
+- `FfprobeError::NotFound` if the ffprobe binary cannot be located
+
+## Basic Usage
+
+<Steps>
+  <Step title="Create a cancellation token">
+    Create a token to control the ffprobe lifetime:
+
+    ```rust
+    use tokio_util::sync::CancellationToken;
+
+    let cancellation_token = CancellationToken::new();
+    ```
+  </Step>
+
+  <Step title="Call ffprobe with arguments">
+    Configure ffprobe arguments in the prepare closure:
+
+    ```rust
+    use libffmpeg::ffprobe::ffprobe;
+    use std::path::Path;
+
+    let input = Path::new("video.mp4");
+    
+    let result = ffprobe(cancellation_token, |cmd| {
+        cmd.arg("-v").arg("quiet");
+        cmd.arg("-print_format").arg("json");
+        cmd.arg("-show_format");
+        cmd.arg("-show_streams");
+        cmd.arg(input);
+    }).await?;
+    ```
+  </Step>
+
+  <Step title="Parse the output">
+    Extract and parse the stdout data:
+
+    ```rust
+    if let Some(exit) = result.exit_code {
+        if exit.success {
+            let json_output = result.stdout_lines.join("\n");
+            // Parse JSON with serde_json or your preferred parser
+            println!("FFprobe output: {}", json_output);
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+## Complete Example: JSON Output
+
+```rust
+use libffmpeg::ffprobe::ffprobe;
+use tokio_util::sync::CancellationToken;
+use serde_json::Value;
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let input = PathBuf::from("video.mp4");
+    let cancellation_token = CancellationToken::new();
+    
+    // Run ffprobe with JSON output
+    let result = ffprobe(cancellation_token, |cmd| {
+        cmd.arg("-v").arg("quiet");
+        cmd.arg("-print_format").arg("json");
+        cmd.arg("-show_format");
+        cmd.arg("-show_streams");
+        cmd.arg(&input);
+    }).await?;
+    
+    // Check exit code
+    let exit_code = result.exit_code
+        .ok_or_else(|| anyhow::anyhow!("No exit code"))?;
+    
+    if !exit_code.success {
+        anyhow::bail!("ffprobe failed: {}", result.stderr_lines.join("\n"));
+    }
+    
+    // Parse JSON output
+    let json_str = result.stdout_lines.join("\n");
+    let data: Value = serde_json::from_str(&json_str)?;
+    
+    // Extract format information
+    if let Some(format) = data["format"].as_object() {
+        println!("Format: {}", format["format_name"].as_str().unwrap_or("unknown"));
+        println!("Duration: {} seconds", format["duration"].as_str().unwrap_or("unknown"));
+        println!("Bitrate: {} bps", format["bit_rate"].as_str().unwrap_or("unknown"));
+    }
+    
+    // Extract stream information
+    if let Some(streams) = data["streams"].as_array() {
+        for (i, stream) in streams.iter().enumerate() {
+            let codec_type = stream["codec_type"].as_str().unwrap_or("unknown");
+            let codec_name = stream["codec_name"].as_str().unwrap_or("unknown");
+            println!("Stream {}: {} ({})", i, codec_type, codec_name);
+            
+            if codec_type == "video" {
+                println!("  Resolution: {}x{}",
+                    stream["width"].as_i64().unwrap_or(0),
+                    stream["height"].as_i64().unwrap_or(0)
+                );
+                println!("  FPS: {}", stream["r_frame_rate"].as_str().unwrap_or("unknown"));
+            }
+        }
+    }
+    
+    Ok(())
+}
+```
+
+## Common Use Cases
+
+### Get File Duration
+
+```rust
+use libffmpeg::ffprobe::ffprobe;
+
+let result = ffprobe(cancellation_token, |cmd| {
+    cmd.arg("-v").arg("quiet");
+    cmd.arg("-show_entries").arg("format=duration");
+    cmd.arg("-of").arg("default=noprint_wrappers=1:nokey=1");
+    cmd.arg(input);
+}).await?;
+
+if let Some(duration_str) = result.stdout_lines.first() {
+    let duration_secs: f64 = duration_str.parse()?;
+    println!("Duration: {:.2} seconds", duration_secs);
+}
+```
+
+<Tip>
+  Use the [`get_duration`](/guides/duration-extraction) utility function for a higher-level API that handles all the parsing for you.
+</Tip>
+
+### Get Video Codec Information
+
+```rust
+let result = ffprobe(cancellation_token, |cmd| {
+    cmd.arg("-v").arg("error");
+    cmd.arg("-select_streams").arg("v:0"); // First video stream
+    cmd.arg("-show_entries").arg("stream=codec_name,width,height,r_frame_rate");
+    cmd.arg("-of").arg("json");
+    cmd.arg(input);
+}).await?;
+
+let json_str = result.stdout_lines.join("\n");
+let data: Value = serde_json::from_str(&json_str)?;
+
+if let Some(stream) = data["streams"][0].as_object() {
+    println!("Codec: {}", stream["codec_name"].as_str().unwrap_or("unknown"));
+    println!("Resolution: {}x{}",
+        stream["width"].as_i64().unwrap_or(0),
+        stream["height"].as_i64().unwrap_or(0)
+    );
+}
+```
+
+### Check Audio Streams
+
+```rust
+let result = ffprobe(cancellation_token, |cmd| {
+    cmd.arg("-v").arg("error");
+    cmd.arg("-select_streams").arg("a"); // All audio streams
+    cmd.arg("-show_entries").arg("stream=codec_name,sample_rate,channels");
+    cmd.arg("-of").arg("json");
+    cmd.arg(input);
+}).await?;
+
+let json_str = result.stdout_lines.join("\n");
+let data: Value = serde_json::from_str(&json_str)?;
+
+if let Some(streams) = data["streams"].as_array() {
+    println!("Found {} audio stream(s)", streams.len());
+    for stream in streams {
+        println!("  Codec: {}", stream["codec_name"].as_str().unwrap_or("unknown"));
+        println!("  Sample rate: {} Hz", stream["sample_rate"].as_str().unwrap_or("unknown"));
+        println!("  Channels: {}", stream["channels"].as_i64().unwrap_or(0));
+    }
+}
+```
+
+### Validate File Integrity
+
+```rust
+let result = ffprobe(cancellation_token, |cmd| {
+    cmd.arg("-v").arg("error");
+    cmd.arg("-show_format");
+    cmd.arg("-of").arg("json");
+    cmd.arg(input);
+}).await?;
+
+if let Some(exit) = result.exit_code {
+    if exit.success && !result.stdout_lines.is_empty() {
+        println!("File is valid");
+    } else {
+        eprintln!("File may be corrupted: {}", result.stderr_lines.join("\n"));
+    }
+}
+```
+
+## Output Formats
+
+FFprobe supports multiple output formats via the `-of` or `-print_format` argument:
+
+### JSON (Recommended)
+
+```rust
+cmd.arg("-print_format").arg("json");
+```
+
+Best for programmatic parsing with strong typing.
+
+### Plain Text
+
+```rust
+cmd.arg("-of").arg("default=noprint_wrappers=1:nokey=1");
+```
+
+Useful for single-value extraction (like duration).
+
+### CSV
+
+```rust
+cmd.arg("-print_format").arg("csv");
+```
+
+Good for batch processing multiple files.
+
+### XML
+
+```rust
+cmd.arg("-print_format").arg("xml");
+```
+
+Useful when integrating with XML-based systems.
+
+## Binary Discovery
+
+The function locates the ffprobe binary by:
+
+1. Checking the `LIBFFMPEG_FFPROBE_PATH` environment variable
+2. Searching the system `PATH`
+
+If not found, it returns `FfprobeError::NotFound`.
+
+<Tip>
+  Set a custom ffprobe location:
+  ```bash
+  export LIBFFMPEG_FFPROBE_PATH=/usr/local/bin/ffprobe
+  ```
+</Tip>
+
+## Error Handling
+
+```rust
+use libffmpeg::ffprobe::{ffprobe, FfprobeError};
+
+match ffprobe(cancellation_token, |cmd| {
+    cmd.arg("-show_format");
+    cmd.arg("input.mp4");
+}).await {
+    Ok(result) => {
+        if let Some(exit) = result.exit_code {
+            if exit.success {
+                println!("Success: {}", result.stdout_lines.join("\n"));
+            } else {
+                eprintln!("ffprobe failed with code: {:?}", exit.code);
+                eprintln!("Stderr: {}", result.stderr_lines.join("\n"));
+            }
+        }
+    }
+    Err(FfprobeError::NotFound) => {
+        eprintln!("ffprobe binary not found in PATH");
+    }
+    Err(e) => {
+        eprintln!("Error: {}", e);
+    }
+}
+```
+
+## Implementation Details
+
+From the source code at `libffmpeg/src/ffprobe/proc.rs:9-50`:
+
+```rust
+pub async fn ffprobe<Prepare>(
+    cancellation_token: CancellationToken,
+    prepare: Prepare,
+) -> Result<CommandExit, FfprobeError>
+where
+    Prepare: FnOnce(&mut Command),
+{
+    tracing::debug!("Starting ffprobe execution");
+
+    let ffprobe_path = find_ffprobe().ok_or(FfprobeError::NotFound).inspect_err(
+        |e| tracing::error!(error =% e, error_context =? e, "ffprobe binary not found"),
+    )?;
+
+    tracing::info!(
+        ffprobe_path = %ffprobe_path.display(),
+        "Executing ffprobe"
+    );
+
+    libcmd::run(
+        ffprobe_path,
+        None,
+        cancellation_token.child_token(),
+        prepare,
+    )
+    .await
+    .inspect(|exit| {
+        tracing::debug!(exit = exit.as_value(), "ffprobe completed");
+    })
+    .inspect_err(|e| {
+        tracing::error!(
+            error = %e,
+            "ffprobe execution failed"
+        );
+    })
+    .map_err(Into::into)
+}
+```
+
+Key characteristics:
+- No output monitoring (stdout/stderr captured in result)
+- Uses `libcmd::run` with `None` for monitor
+- Includes structured tracing
+- Creates a child cancellation token
+
+## Performance Considerations
+
+<Note>
+  FFprobe needs to read the entire file to extract some information (like duration). For large files, this can take time. Consider:
+  
+  - Using `-threads` to parallelize decoding
+  - Limiting analysis with `-analyzeduration` and `-probesize`
+  - Caching results for frequently-accessed files
+</Note>
+
+### Optimize for Speed
+
+```rust
+let result = ffprobe(cancellation_token, |cmd| {
+    cmd.arg("-threads").arg("4"); // Use 4 threads
+    cmd.arg("-analyzeduration").arg("1000000"); // Analyze first 1 second
+    cmd.arg("-probesize").arg("1000000"); // Probe first 1MB
+    cmd.arg("-v").arg("quiet");
+    cmd.arg("-show_format");
+    cmd.arg(input);
+}).await?;
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Duration Extraction" icon="clock" href="/guides/duration-extraction">
+    Use get_duration for easier duration extraction
+  </Card>
+  <Card title="FFmpeg Execution" icon="play" href="/guides/ffmpeg-standard">
+    Run FFmpeg with the extracted metadata
+  </Card>
+  <Card title="Error Handling" icon="triangle-exclamation" href="/api/errors">
+    Handle FfprobeError types
+  </Card>
+  <Card title="API Reference" icon="book" href="/api/ffprobe">
+    Complete ffprobe API documentation
+  </Card>
+</CardGroup>

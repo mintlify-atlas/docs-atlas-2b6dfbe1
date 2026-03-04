@@ -1,0 +1,590 @@
+---
+title: "Monitoring"
+description: "Real-time output monitoring with CommandMonitor and CommandMonitorServer"
+---
+
+libffmpeg provides sophisticated output monitoring capabilities through the `CommandMonitor`, `CommandMonitorServer`, and `CommandMonitorClient` types from the `libcmd` crate. These enable real-time streaming of stdout and stderr, progress tracking, and bidirectional communication.
+
+## Overview
+
+Monitoring allows you to:
+
+- **Stream output in real-time** - Receive stdout and stderr lines as they're produced
+- **Parse progress data** - Extract encoding progress from ffmpeg's `-progress` output
+- **Send stdin commands** - Send commands like `q` to ffmpeg's stdin (graceful mode)
+- **Build responsive UIs** - Update progress bars, logs, and status displays
+- **Debug encoding issues** - Capture and analyze ffmpeg's diagnostic output
+
+<Note>
+Monitoring is only available in [standard mode](/concepts/execution-modes#standard-mode) and [graceful mode](/concepts/execution-modes#graceful-mode). [Slim mode](/concepts/execution-modes#slim-mode) does not capture output.
+</Note>
+
+## Core Types
+
+### CommandMonitor
+
+The main entry point for creating a monitoring system.
+
+```rust
+use libffmpeg::libcmd::CommandMonitor;
+
+let monitor = CommandMonitor::with_capacity(100);
+```
+
+The `with_capacity` parameter sets the channel buffer size - the number of messages that can be queued before the sender blocks.
+
+**Fields:**
+- `server: CommandMonitorServer` - Used by execution functions to send output
+- `client: CommandMonitorClient` - Used by your code to receive output and send stdin
+
+### CommandMonitorServer
+
+Passed to execution functions to enable output monitoring.
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/standard.rs:17-18`:
+
+```rust
+pub async fn ffmpeg<Prepare>(
+    cancellation_token: CancellationToken,
+    server: &CommandMonitorServer,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+```
+
+### CommandMonitorClient
+
+Receives stdout/stderr messages and can send stdin commands (in graceful mode).
+
+From `~/workspace/source/libffmpeg/examples/transcode_with_progress.rs:36`:
+
+```rust
+let mut client = monitor.client.clone();
+```
+
+## Message Types
+
+### CommandMonitorMessage
+
+Messages received from the client:
+
+```rust
+pub enum CommandMonitorMessage {
+    Stdout { line: String },
+    Stderr { line: String },
+}
+```
+
+From `~/workspace/source/libffmpeg/examples/transcode_with_progress.rs:44-70`:
+
+```rust
+while let Some(Some(delivery)) =
+    client.recv().with_cancellation_token(&exit_token).await
+{
+    match delivery {
+        libffmpeg::libcmd::CommandMonitorMessage::Stdout { line } => {
+            if !progress.with_line(&line) {
+                println!("{}[O] {}{}", "\x1b[32m", line, "\x1b[0m");
+                continue;
+            }
+
+            if let Some(update) = progress.finish() {
+                println!(
+                    "{}[P] {:.2}% ({} / {}); bitrate={} @ {}fps ({:.1}x realtime) {}",
+                    "\x1b[33m",
+                    100f64 * update.out_time.as_secs_f64() / total,
+                    humantime::format_duration(update.out_time),
+                    humantime::format_duration(Duration::from_secs_f64(total)),
+                    humansize::format_size_i(
+                        update.bitrate,
+                        humansize::DECIMAL.suffix("ps")
+                    ),
+                    update.fps,
+                    update.speed,
+                    "\x1b[0m"
+                );
+            }
+        }
+        libffmpeg::libcmd::CommandMonitorMessage::Stderr { line } => {
+            eprintln!("{}[E] {}{}", "\x1b[31m", line, "\x1b[0m")
+        }
+    }
+}
+```
+
+## Basic Monitoring Setup
+
+### Standard Mode Example
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg;
+use libffmpeg::libcmd::{CommandMonitor, CommandMonitorMessage};
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let exit_token = token.child_token();
+
+// Create monitor with buffer capacity
+let monitor = CommandMonitor::with_capacity(100);
+
+// Spawn task to handle output
+let monitor_task = {
+    let mut client = monitor.client.clone();
+    let exit_token = exit_token.clone();
+    
+    tokio::spawn(async move {
+        while let Some(Some(message)) = client.recv().with_cancellation_token(&exit_token).await {
+            match message {
+                CommandMonitorMessage::Stdout { line } => {
+                    println!("[stdout] {}", line);
+                }
+                CommandMonitorMessage::Stderr { line } => {
+                    eprintln!("[stderr] {}", line);
+                }
+            }
+        }
+    })
+};
+
+// Run ffmpeg with monitoring
+let result = ffmpeg(token, &monitor.server, |cmd| {
+    cmd.arg("-i").arg("input.mp4");
+    cmd.arg("-c:v").arg("libx264");
+    cmd.arg("output.mp4");
+}).await?;
+
+// Signal monitor task to exit
+exit_token.cancel();
+
+// Wait for monitor to finish
+monitor_task.await?;
+```
+
+### Graceful Mode Example
+
+Graceful mode requires both client and server:
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/graceful.rs:17-21`:
+
+```rust
+pub async fn ffmpeg_graceful<Prepare>(
+    cancellation_token: CancellationToken,
+    client: &CommandMonitorClient,
+    server: &CommandMonitorServer,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+```
+
+Usage:
+
+```rust
+use libffmpeg::ffmpeg::ffmpeg_graceful;
+use libffmpeg::libcmd::CommandMonitor;
+
+let token = CancellationToken::new();
+let monitor = CommandMonitor::with_capacity(100);
+
+// Graceful mode needs both client and server
+let result = ffmpeg_graceful(
+    token,
+    &monitor.client,
+    &monitor.server,
+    |cmd| {
+        cmd.arg("-i").arg("input.mp4");
+        cmd.arg("-c:v").arg("libx264");
+        cmd.arg("output.mp4");
+    },
+).await?;
+```
+
+The client is used internally to send the `q` command on cancellation:
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/graceful.rs:72`:
+
+```rust
+// Send quit
+client.send("q").await;
+```
+
+## Progress Parsing
+
+libffmpeg includes built-in support for parsing ffmpeg's `-progress pipe:1` output.
+
+### PartialProgress
+
+Accumulates progress data line by line.
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/progress.rs:13-27`:
+
+```rust
+/// Accumulator for parsing ffmpeg's `-progress pipe:1` output line by line.
+///
+/// Feed lines via [`with_line`](Self::with_line), then call [`finish`](Self::finish)
+/// once a complete progress block has been received to produce a [`Progress`] snapshot.
+///
+/// ```no_run
+/// # use libffmpeg::ffmpeg::progress::PartialProgress;
+/// let mut partial = PartialProgress::default();
+/// partial.with_line("frame=120");
+/// partial.with_line("fps=30.00");
+/// partial.with_line("progress=continue");
+/// if let Some(progress) = partial.finish() {
+///     println!("frame={} fps={}", progress.frame, progress.fps);
+/// }
+/// ```
+```
+
+### Progress Struct
+
+A complete progress snapshot.
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/progress.rs:152-174`:
+
+```rust
+/// A parsed progress snapshot from ffmpeg's `-progress pipe:1` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Progress {
+    /// Number of frames processed so far.
+    pub frame: usize,
+    /// Current encoding speed in frames per second.
+    pub fps: f64,
+    /// Current bitrate in bytes per second.
+    pub bitrate: isize,
+    /// Total output size in bytes.
+    pub total_size: usize,
+    /// Elapsed output time (position in the output stream).
+    pub out_time: Duration,
+    /// Number of duplicated frames.
+    pub dup_frames: usize,
+    /// Number of dropped frames.
+    pub drop_frames: usize,
+    /// Encoding speed as a multiplier of realtime (e.g. 2.0 = 2x realtime).
+    pub speed: f64,
+    /// Whether ffmpeg is still processing or has finished.
+    pub progress: ProgressState,
+}
+```
+
+### Progress State
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/progress.rs:137-150`:
+
+```rust
+/// The state reported in ffmpeg's `progress=` line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    content = "raw",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ProgressState {
+    Continue,
+    End,
+    Unknown(String),
+}
+```
+
+### Complete Progress Example
+
+From `~/workspace/source/libffmpeg/examples/transcode_with_progress.rs:38-67`:
+
+```rust
+let mut progress = libffmpeg::ffmpeg::progress::PartialProgress::default();
+
+while let Some(Some(delivery)) =
+    client.recv().with_cancellation_token(&exit_token).await
+{
+    match delivery {
+        libffmpeg::libcmd::CommandMonitorMessage::Stdout { line } => {
+            if !progress.with_line(&line) {
+                println!("{}[O] {}{}", "\x1b[32m", line, "\x1b[0m");
+                continue;
+            }
+
+            if let Some(update) = progress.finish() {
+                println!(
+                    "{}[P] {:.2}% ({} / {}); bitrate={} @ {}fps ({:.1}x realtime) {}",
+                    "\x1b[33m",
+                    100f64 * update.out_time.as_secs_f64() / total,
+                    humantime::format_duration(update.out_time),
+                    humantime::format_duration(Duration::from_secs_f64(total)),
+                    humansize::format_size_i(
+                        update.bitrate,
+                        humansize::DECIMAL.suffix("ps")
+                    ),
+                    update.fps,
+                    update.speed,
+                    "\x1b[0m"
+                );
+            }
+        }
+        libffmpeg::libcmd::CommandMonitorMessage::Stderr { line } => {
+            eprintln!("{}[E] {}{}", "\x1b[31m", line, "\x1b[0m")
+        }
+    }
+}
+```
+
+**Key points:**
+
+1. Create a `PartialProgress` instance
+2. Feed each stdout line to `with_line()`
+3. Check if `with_line()` returns `true` (line was recognized)
+4. Call `finish()` to get a complete `Progress` snapshot
+5. The snapshot is only returned when a complete progress block is parsed
+
+### Enabling Progress Output
+
+You must add `-progress pipe:1` to your ffmpeg command:
+
+From `~/workspace/source/libffmpeg/examples/transcode_with_progress.rs:84`:
+
+```rust
+cmd.arg("-progress").arg("pipe:1");
+```
+
+This tells ffmpeg to write progress data to stdout (pipe:1) in a parseable format.
+
+## Advanced Patterns
+
+### Progress Percentage Calculation
+
+From `~/workspace/source/libffmpeg/examples/transcode_with_progress.rs:28-31,54-55`:
+
+```rust
+let video_duration =
+    libffmpeg::util::get_duration(&args.input, root_token.child_token()).await?;
+
+let total = args.time.unwrap_or(video_duration.as_secs()) as f64;
+
+// Later, in the monitor loop:
+100f64 * update.out_time.as_secs_f64() / total,
+```
+
+To calculate percentage:
+1. Get the video duration using `libffmpeg::util::get_duration()`
+2. Calculate: `(current_time / total_duration) * 100`
+
+### Filtering Progress Lines
+
+From `~/workspace/source/libffmpeg/examples/transcode_with_progress.rs:46-49`:
+
+```rust
+if !progress.with_line(&line) {
+    println!("{}[O] {}{}", "\x1b[32m", line, "\x1b[0m");
+    continue;
+}
+```
+
+The `with_line()` method returns:
+- `true` - Line was recognized as progress data
+- `false` - Line is not progress data (log output, etc.)
+
+This allows you to handle progress and non-progress output differently.
+
+### Cancellation with Monitoring
+
+From `~/workspace/source/libffmpeg/examples/transcode_with_progress.rs:90-94`:
+
+```rust
+exit_token.cancel();
+
+if let Err(e) = monitor_fut.await {
+    eprintln!("Failed to wait for monitor: {}", e);
+}
+```
+
+Always:
+1. Cancel the exit token after ffmpeg completes
+2. Await the monitor task to ensure all output is processed
+3. Handle potential task join errors
+
+### Bidirectional Communication (Graceful Mode)
+
+The client can send commands to ffmpeg's stdin:
+
+```rust
+use libffmpeg::libcmd::CommandMonitor;
+
+let monitor = CommandMonitor::with_capacity(100);
+
+// Send stdin command
+monitor.client.send("q\n").await;
+```
+
+This is used internally by graceful mode:
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/graceful.rs:72`:
+
+```rust
+// Send quit
+client.send("q").await;
+```
+
+<Note>
+You can send any ffmpeg interactive command this way, such as:
+- `q` - Quit gracefully
+- `c` - Continue (unpause)
+- `s` - Show QP histogram
+</Note>
+
+## Monitoring Best Practices
+
+### ✅ Do
+
+<Check>Set appropriate buffer capacity based on expected output volume</Check>
+<Check>Always spawn a separate task to receive monitor messages</Check>
+<Check>Cancel the exit token when ffmpeg completes</Check>
+<Check>Await the monitor task to ensure all output is processed</Check>
+<Check>Handle both stdout and stderr messages</Check>
+<Check>Use progress parsing for user-facing progress indicators</Check>
+
+### ❌ Don't
+
+<Warning>Don't block the monitor task with slow operations - buffer can overflow</Warning>
+<Warning>Don't forget to cancel the exit token - monitor will hang</Warning>
+<Warning>Don't assume every stdout line is progress data</Warning>
+<Warning>Don't use a tiny buffer capacity - may cause backpressure</Warning>
+
+## Capacity and Backpressure
+
+```rust
+let monitor = CommandMonitor::with_capacity(100);
+```
+
+The capacity parameter controls buffering:
+
+- **Too small** - The ffmpeg process may block waiting for your code to consume messages
+- **Too large** - More memory usage, potential delays in processing
+- **Recommended** - 50-200 for most use cases
+
+<Tip>
+If ffmpeg produces output very quickly (e.g., with high verbosity), increase the capacity to prevent backpressure. If you're processing messages slowly (e.g., writing to disk), use a larger buffer.
+</Tip>
+
+## Error Handling
+
+### Monitor Task Errors
+
+```rust
+let monitor_task = tokio::spawn(async move {
+    while let Some(Some(message)) = client.recv().with_cancellation_token(&exit_token).await {
+        match message {
+            CommandMonitorMessage::Stdout { line } => {
+                // Handle stdout
+            }
+            CommandMonitorMessage::Stderr { line } => {
+                // Handle stderr
+            }
+        }
+    }
+});
+
+// Later:
+match monitor_task.await {
+    Ok(_) => println!("Monitor completed successfully"),
+    Err(e) => eprintln!("Monitor task panicked: {}", e),
+}
+```
+
+### Progress Parsing Errors
+
+```rust
+let mut progress = PartialProgress::default();
+
+if progress.with_line(&line) {
+    if let Some(update) = progress.finish() {
+        // Valid progress update
+        println!("Progress: {}%", (update.out_time.as_secs_f64() / total) * 100.0);
+    } else {
+        // Incomplete progress block, keep accumulating
+    }
+} else {
+    // Not a progress line, handle as regular output
+    println!("Output: {}", line);
+}
+```
+
+From `~/workspace/source/libffmpeg/src/ffmpeg/progress.rs:112-134`:
+
+```rust
+/// Attempt to produce a complete [`Progress`] snapshot from the accumulated state.
+///
+/// Returns `None` if no `progress=` line has been received yet, or if the
+/// bitrate value could not be parsed.
+#[must_use]
+pub fn finish(&self) -> Option<Progress> {
+    let progress = match &self.progress {
+        PartialProgressState::Unset => return None,
+        PartialProgressState::Continue => ProgressState::Continue,
+        PartialProgressState::End => ProgressState::End,
+        PartialProgressState::Unknown(v) => ProgressState::Unknown(v.clone()),
+    };
+
+    let num_part = self.bitrate.split("kbits").next().unwrap_or("0");
+    let kbitsf = num_part.parse::<f32>().ok()?;
+    let bitrate = (kbitsf * 1024.0) as isize;
+    Some(Progress {
+        frame: self.frame,
+        fps: self.fps,
+        bitrate,
+        total_size: self.total_size,
+        out_time: Duration::from_micros(self.out_time_us as u64),
+        dup_frames: self.dup_frames,
+        drop_frames: self.drop_frames,
+        speed: self.speed.trim_end_matches('x').parse().unwrap_or_default(),
+        progress,
+    })
+}
+```
+
+The `finish()` method returns `None` if:
+- No `progress=` line has been received yet
+- Bitrate parsing fails
+
+## Testing Monitoring
+
+```rust
+#[tokio::test]
+async fn test_monitoring() {
+    let token = CancellationToken::new();
+    let exit_token = token.child_token();
+    let monitor = CommandMonitor::with_capacity(100);
+    
+    let mut messages = Vec::new();
+    let monitor_task = {
+        let mut client = monitor.client.clone();
+        let exit_token = exit_token.clone();
+        
+        tokio::spawn(async move {
+            let mut msgs = Vec::new();
+            while let Some(Some(message)) = client.recv().with_cancellation_token(&exit_token).await {
+                msgs.push(message);
+            }
+            msgs
+        })
+    };
+    
+    let result = ffmpeg(token, &monitor.server, |cmd| {
+        cmd.arg("-version");
+    }).await;
+    
+    exit_token.cancel();
+    let messages = monitor_task.await.unwrap();
+    
+    assert!(result.is_ok());
+    assert!(!messages.is_empty()); // Should have received some output
+}
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Execution Modes" icon="play" href="/concepts/execution-modes">
+    Choose standard or graceful mode for monitoring
+  </Card>
+  <Card title="Cancellation" icon="circle-stop" href="/concepts/cancellation">
+    Coordinate cancellation with monitoring tasks
+  </Card>
+</CardGroup>

@@ -1,0 +1,433 @@
+---
+title: "Extracting Media Duration"
+description: "Learn how to use get_duration to extract media file duration with ffprobe"
+---
+
+## Overview
+
+The `get_duration` utility function extracts the duration of a media file using ffprobe. It provides a high-level, type-safe API that handles all the complexity of running ffprobe, parsing output, and error handling.
+
+## When to Use get_duration
+
+Use `get_duration` when you need to:
+
+- Calculate progress percentage during encoding
+- Validate media file length before processing
+- Display video duration to users
+- Estimate processing time
+- Implement time-based operations
+
+This is commonly used before calling [`ffmpeg`](/guides/ffmpeg-standard) to enable [progress percentage calculation](/guides/progress-parsing).
+
+## Function Signature
+
+```rust
+pub async fn get_duration<P: AsRef<Path>>(
+    input: P,
+    cancellation_token: CancellationToken,
+) -> Result<Duration, DurationError>
+```
+
+## Parameters
+
+<ParamField path="input" type="impl AsRef<Path>" required>
+  Path to the media file (video or audio)
+</ParamField>
+
+<ParamField path="cancellation_token" type="CancellationToken" required>
+  Token for cancelling the ffprobe operation if needed
+</ParamField>
+
+## Return Value
+
+Returns `Result<Duration, DurationError>` where:
+- `Duration` is a `std::time::Duration` representing the media duration
+- `DurationError` provides detailed error information
+
+### DurationError Variants
+
+From `libffmpeg/src/util/duration.rs:15-31`:
+
+```rust
+pub enum DurationError {
+    // ffprobe execution failed
+    Ffprobe { inner_error: FfprobeError },
+    
+    // Process returned but no exit status available
+    IncompleteSubprocess { result: CommandExit },
+    
+    // ffprobe exited with non-zero code
+    ExitedUnsuccessfully { exit_code: CommandExitCode },
+    
+    // ffprobe produced no output
+    ExpectedLine { result: CommandExit },
+    
+    // Failed to parse duration value
+    Parse { inner_error: AnyError },
+}
+```
+
+## Basic Usage
+
+<Steps>
+  <Step title="Import the function">
+    Import `get_duration` from the util module:
+
+    ```rust
+    use libffmpeg::util::get_duration;
+    use tokio_util::sync::CancellationToken;
+    use std::path::Path;
+    ```
+  </Step>
+
+  <Step title="Create a cancellation token">
+    Create a token to control the operation:
+
+    ```rust
+    let cancellation_token = CancellationToken::new();
+    ```
+  </Step>
+
+  <Step title="Call get_duration">
+    Pass the file path and token:
+
+    ```rust
+    let input = Path::new("video.mp4");
+    let duration = get_duration(input, cancellation_token).await?;
+    
+    println!("Duration: {:.2} seconds", duration.as_secs_f64());
+    ```
+  </Step>
+</Steps>
+
+## Complete Example
+
+```rust
+use libffmpeg::util::get_duration;
+use tokio_util::sync::CancellationToken;
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let input = PathBuf::from("video.mp4");
+    let cancellation_token = CancellationToken::new();
+    
+    // Extract duration
+    let duration = get_duration(&input, cancellation_token).await?;
+    
+    // Display in various formats
+    println!("Duration: {} seconds", duration.as_secs());
+    println!("Duration: {:.2} seconds (precise)", duration.as_secs_f64());
+    println!("Duration: {} minutes", duration.as_secs() / 60);
+    println!("Duration: {}", humantime::format_duration(duration));
+    
+    Ok(())
+}
+```
+
+## Common Use Cases
+
+### Before Transcoding
+
+Get duration before starting a transcode to enable progress tracking:
+
+```rust
+use libffmpeg::util::get_duration;
+use libffmpeg::ffmpeg::ffmpeg;
+
+let input = "input.mp4";
+let output = "output.mp4";
+
+// Get duration first
+let total_duration = get_duration(
+    input,
+    cancellation_token.child_token()
+).await?;
+
+println!("Processing {} second video", total_duration.as_secs());
+
+// Then transcode with progress monitoring
+let result = ffmpeg(cancellation_token, &monitor.server, |cmd| {
+    cmd.arg("-i").arg(input);
+    cmd.arg("-progress").arg("pipe:1");
+    cmd.arg(output);
+}).await?;
+```
+
+### Validate Media Length
+
+```rust
+let duration = get_duration(input, cancellation_token).await?;
+
+if duration.as_secs() > 3600 {
+    anyhow::bail!("Video too long: maximum 1 hour");
+}
+
+if duration.as_secs() < 1 {
+    anyhow::bail!("Video too short: minimum 1 second");
+}
+
+println!("Duration valid: {:.2}s", duration.as_secs_f64());
+```
+
+### Calculate Progress Percentage
+
+Combine with [PartialProgress](/guides/progress-parsing) for percentage display:
+
+```rust
+use libffmpeg::ffmpeg::progress::PartialProgress;
+
+let total_duration = get_duration(input, cancellation_token.child_token()).await?;
+let total_seconds = total_duration.as_secs_f64();
+
+let mut progress = PartialProgress::default();
+
+// In monitoring loop
+if let Some(update) = progress.finish() {
+    let elapsed_seconds = update.out_time.as_secs_f64();
+    let percentage = (elapsed_seconds / total_seconds) * 100.0;
+    
+    println!("Progress: {:.2}%", percentage);
+}
+```
+
+### Batch Processing
+
+```rust
+use tokio::fs;
+
+let mut dir = fs::read_dir("videos").await?;
+let mut total_duration = Duration::from_secs(0);
+
+while let Some(entry) = dir.next_entry().await? {
+    let path = entry.path();
+    
+    if path.extension().map(|e| e == "mp4").unwrap_or(false) {
+        match get_duration(&path, cancellation_token.child_token()).await {
+            Ok(duration) => {
+                println!("{}: {:.2}s", path.display(), duration.as_secs_f64());
+                total_duration += duration;
+            }
+            Err(e) => {
+                eprintln!("Error reading {}: {}", path.display(), e);
+            }
+        }
+    }
+}
+
+println!("Total duration: {}", humantime::format_duration(total_duration));
+```
+
+## Implementation Details
+
+From `libffmpeg/src/util/duration.rs:33-116`, the function:
+
+1. Runs ffprobe with specific arguments:
+   ```rust
+   let mut result = ffprobe(cancellation_token, move |cmd| {
+       cmd.arg("-threads").arg("4");
+       cmd.arg("-v").arg("quiet");
+       cmd.arg("-show_entries").arg("format=duration");
+       cmd.arg("-of").arg("default=noprint_wrappers=1:nokey=1");
+       cmd.arg(input.as_ref());
+   }).await?;
+   ```
+
+2. Validates the exit code:
+   ```rust
+   let Some(exit_code) = result.exit_code.take() else {
+       return Err(DurationError::IncompleteSubprocess { result });
+   };
+   
+   if !exit_code.success {
+       return Err(DurationError::ExitedUnsuccessfully { exit_code });
+   }
+   ```
+
+3. Parses the duration from stdout:
+   ```rust
+   let Some(duration_line) = result.stdout_lines.first() else {
+       return Err(DurationError::ExpectedLine { result });
+   };
+   
+   let duration_seconds = duration_line.parse::<f64>()
+       .map_err(|e| DurationError::Parse { inner_error: e.into() })?;
+   
+   let duration = Duration::from_secs_f64(duration_seconds);
+   ```
+
+<Tip>
+  The function uses `-threads 4` to parallelize ffprobe's analysis. This speeds up duration extraction for large files.
+</Tip>
+
+## FFprobe Arguments Explained
+
+| Argument | Purpose |
+|----------|--------|
+| `-threads 4` | Use 4 threads for faster processing |
+| `-v quiet` | Suppress informational messages |
+| `-show_entries format=duration` | Only show duration field |
+| `-of default=noprint_wrappers=1:nokey=1` | Output only the value, no formatting |
+
+This produces simple output like:
+```
+123.456
+```
+
+## Error Handling
+
+```rust
+use libffmpeg::util::{get_duration, DurationError};
+
+match get_duration(input, cancellation_token).await {
+    Ok(duration) => {
+        println!("Duration: {:.2}s", duration.as_secs_f64());
+    }
+    Err(DurationError::Ffprobe { inner_error }) => {
+        eprintln!("ffprobe not found or failed: {}", inner_error);
+    }
+    Err(DurationError::ExitedUnsuccessfully { exit_code }) => {
+        eprintln!("ffprobe failed with code: {:?}", exit_code.code);
+    }
+    Err(DurationError::ExpectedLine { result }) => {
+        eprintln!("ffprobe produced no output: {:?}", result);
+    }
+    Err(DurationError::Parse { inner_error }) => {
+        eprintln!("Failed to parse duration: {}", inner_error);
+    }
+    Err(DurationError::IncompleteSubprocess { result }) => {
+        eprintln!("Process terminated abnormally: {:?}", result);
+    }
+}
+```
+
+## Performance Considerations
+
+<Note>
+  Duration extraction requires ffprobe to read the file header and potentially scan the entire file. For large files or network streams, this can take time.
+</Note>
+
+### Optimization Tips
+
+1. **Cache results**: If processing the same file multiple times, cache the duration
+2. **Parallel extraction**: Use `tokio::spawn` to extract durations for multiple files concurrently
+3. **Timeouts**: Set reasonable timeouts for network streams
+
+### Parallel Duration Extraction
+
+```rust
+use futures::future::join_all;
+
+let files = vec!["video1.mp4", "video2.mp4", "video3.mp4"];
+
+let tasks: Vec<_> = files.into_iter().map(|file| {
+    let token = cancellation_token.child_token();
+    tokio::spawn(async move {
+        (file, get_duration(file, token).await)
+    })
+}).collect();
+
+let results = join_all(tasks).await;
+
+for result in results {
+    match result {
+        Ok((file, Ok(duration))) => {
+            println!("{}: {:.2}s", file, duration.as_secs_f64());
+        }
+        Ok((file, Err(e))) => {
+            eprintln!("{}: error: {}", file, e);
+        }
+        Err(e) => {
+            eprintln!("Task error: {}", e);
+        }
+    }
+}
+```
+
+## Working with Duration
+
+The returned `std::time::Duration` provides many useful methods:
+
+```rust
+let duration = get_duration(input, cancellation_token).await?;
+
+// Get seconds as integer
+let secs = duration.as_secs(); // u64
+
+// Get seconds as float
+let secs_f64 = duration.as_secs_f64(); // f64
+let secs_f32 = duration.as_secs_f32(); // f32
+
+// Get milliseconds
+let millis = duration.as_millis(); // u128
+
+// Get microseconds  
+let micros = duration.as_micros(); // u128
+
+// Convert to minutes
+let minutes = duration.as_secs() / 60;
+
+// Convert to hours:minutes:seconds
+let total_secs = duration.as_secs();
+let hours = total_secs / 3600;
+let minutes = (total_secs % 3600) / 60;
+let seconds = total_secs % 60;
+println!("Duration: {:02}:{:02}:{:02}", hours, minutes, seconds);
+```
+
+## Formatting Duration
+
+Use the `humantime` crate for human-readable formatting:
+
+```rust
+use humantime::format_duration;
+
+let duration = get_duration(input, cancellation_token).await?;
+
+println!("Duration: {}", format_duration(duration));
+// Output: "Duration: 2h 3m 45s"
+```
+
+## Cancellation Support
+
+Cancel the duration extraction if it takes too long:
+
+```rust
+use tokio::time::timeout;
+
+let cancellation_token = CancellationToken::new();
+
+// Set 5 second timeout
+match timeout(
+    Duration::from_secs(5),
+    get_duration(input, cancellation_token.child_token())
+).await {
+    Ok(Ok(duration)) => {
+        println!("Duration: {:.2}s", duration.as_secs_f64());
+    }
+    Ok(Err(e)) => {
+        eprintln!("Error: {}", e);
+    }
+    Err(_) => {
+        eprintln!("Timeout: duration extraction took too long");
+        cancellation_token.cancel();
+    }
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Progress Parsing" icon="chart-line" href="/guides/progress-parsing">
+    Use duration for progress percentage calculation
+  </Card>
+  <Card title="FFmpeg Standard" icon="play" href="/guides/ffmpeg-standard">
+    Run FFmpeg with duration-based progress
+  </Card>
+  <Card title="FFprobe" icon="info-circle" href="/guides/ffprobe">
+    Use ffprobe directly for more metadata
+  </Card>
+  <Card title="API Reference" icon="book" href="/api/util">
+    Complete utility functions documentation
+  </Card>
+</CardGroup>

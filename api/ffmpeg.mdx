@@ -1,0 +1,177 @@
+---
+title: "ffmpeg"
+description: "Functions for executing ffmpeg with different execution modes"
+---
+
+The `ffmpeg` module provides three variants of ffmpeg execution, each with different levels of control and monitoring capabilities.
+
+## ffmpeg_slim
+
+Run ffmpeg with cancellation support only (no output monitoring).
+
+This is the lightest-weight variant — it spawns ffmpeg, waits for it to complete, and returns the exit result. Use `ffmpeg` if you need to stream stdout/stderr, or `ffmpeg_graceful` for graceful shutdown.
+
+```rust
+pub async fn ffmpeg_slim<Prepare>(
+    cancellation_token: CancellationToken,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+where
+    Prepare: FnOnce(&mut Command),
+```
+
+### Parameters
+
+<ParamField path="cancellation_token" type="CancellationToken" required>
+  A token to cancel the ffmpeg process. When cancelled, the process is killed immediately.
+</ParamField>
+
+<ParamField path="prepare" type="FnOnce(&mut Command)" required>
+  A closure that configures the ffmpeg command before execution. Use this to add arguments, set environment variables, etc.
+</ParamField>
+
+### Returns
+
+Returns `Result<CommandExit, FfmpegError>`:
+- `Ok(CommandExit)` - Contains the exit code, stdout, and stderr from the ffmpeg process
+- `Err(FfmpegError::NotFound)` - The ffmpeg binary could not be found in PATH or via `LIBFFMPEG_FFMPEG_PATH`
+
+### Example
+
+```rust
+use libffmpeg::ffmpeg_slim;
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let result = ffmpeg_slim(token, |cmd| {
+    cmd.arg("-i")
+        .arg("input.mp4")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("output.mp4");
+}).await?;
+```
+
+## ffmpeg
+
+Run ffmpeg with output monitoring via a `CommandMonitorServer`.
+
+Stdout and stderr lines are streamed through the monitor, allowing real-time progress parsing or logging. On cancellation the process is killed immediately — use `ffmpeg_graceful` if you need stdin-based quit with a SIGKILL fallback.
+
+```rust
+pub async fn ffmpeg<Prepare>(
+    cancellation_token: CancellationToken,
+    server: &CommandMonitorServer,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+where
+    Prepare: FnOnce(&mut Command),
+```
+
+### Parameters
+
+<ParamField path="cancellation_token" type="CancellationToken" required>
+  A token to cancel the ffmpeg process. When cancelled, the process is killed immediately.
+</ParamField>
+
+<ParamField path="server" type="&CommandMonitorServer" required>
+  A server that monitors stdout/stderr output from the ffmpeg process. Use this to track progress or parse output in real-time.
+</ParamField>
+
+<ParamField path="prepare" type="FnOnce(&mut Command)" required>
+  A closure that configures the ffmpeg command before execution.
+</ParamField>
+
+### Returns
+
+Returns `Result<CommandExit, FfmpegError>`:
+- `Ok(CommandExit)` - Contains the exit code, stdout, and stderr from the ffmpeg process
+- `Err(FfmpegError::NotFound)` - The ffmpeg binary could not be found
+
+### Example
+
+```rust
+use libffmpeg::ffmpeg;
+use libcmd::CommandMonitorServer;
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let server = CommandMonitorServer::new();
+
+let result = ffmpeg(token, &server, |cmd| {
+    cmd.arg("-i")
+        .arg("input.mp4")
+        .arg("-progress")
+        .arg("pipe:1")
+        .arg("output.mp4");
+}).await?;
+```
+
+## ffmpeg_graceful
+
+Run ffmpeg with output monitoring and graceful shutdown.
+
+On cancellation, sends `q` to ffmpeg's stdin (its built-in quit command), giving the process up to 5 seconds to exit cleanly before falling back to SIGKILL. This allows ffmpeg to finalize the output file properly.
+
+```rust
+pub async fn ffmpeg_graceful<Prepare>(
+    cancellation_token: CancellationToken,
+    client: &CommandMonitorClient,
+    server: &CommandMonitorServer,
+    prepare: Prepare,
+) -> Result<CommandExit, FfmpegError>
+where
+    Prepare: FnOnce(&mut Command),
+```
+
+### Parameters
+
+<ParamField path="cancellation_token" type="CancellationToken" required>
+  A token to cancel the ffmpeg process. When cancelled, the function sends "q" to stdin and waits up to 5 seconds before force-killing.
+</ParamField>
+
+<ParamField path="client" type="&CommandMonitorClient" required>
+  A client used to send the "q" command to ffmpeg's stdin during graceful shutdown.
+</ParamField>
+
+<ParamField path="server" type="&CommandMonitorServer" required>
+  A server that monitors stdout/stderr output from the ffmpeg process.
+</ParamField>
+
+<ParamField path="prepare" type="FnOnce(&mut Command)" required>
+  A closure that configures the ffmpeg command before execution.
+</ParamField>
+
+### Returns
+
+Returns `Result<CommandExit, FfmpegError>`:
+- `Ok(CommandExit)` - Contains the exit code, stdout, and stderr from the ffmpeg process
+- `Err(FfmpegError::NotFound)` - The ffmpeg binary could not be found
+
+### Graceful Shutdown Flow
+
+1. If the process exits naturally before cancellation, do nothing and return early
+2. User requests cancellation via the `cancellation_token`
+3. Send "q" to ffmpeg's stdin
+4. Wait up to 5 seconds for the process to exit gracefully
+5. If the process doesn't exit after 5 seconds, send SIGKILL
+
+### Example
+
+```rust
+use libffmpeg::ffmpeg_graceful;
+use libcmd::{CommandMonitorClient, CommandMonitorServer};
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+let server = CommandMonitorServer::new();
+let client = CommandMonitorClient::new();
+
+let result = ffmpeg_graceful(token, &client, &server, |cmd| {
+    cmd.arg("-i")
+        .arg("input.mp4")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("output.mp4");
+}).await?;
+```
