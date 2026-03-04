@@ -1,0 +1,95 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "libffmpeg",
+  "projectDescription": "Async Rust wrapper for ffmpeg and ffprobe, built on tokio, with tracing and graceful shutdown support",
+  "theme": "aspen",
+  "primaryColor": "#00D26A",
+  "lightColor": "#4AE294",
+  "darkColor": "#00A054",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/execution-modes",
+              "concepts/binary-discovery",
+              "concepts/cancellation",
+              "concepts/monitoring"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/ffmpeg-slim",
+              "guides/ffmpeg-standard",
+              "guides/ffmpeg-graceful",
+              "guides/ffprobe",
+              "guides/progress-parsing",
+              "guides/duration-extraction"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/basic-transcode",
+              "examples/progress-monitoring",
+              "examples/graceful-shutdown"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Modules",
+            "pages": [
+              "api/ffmpeg",
+              "api/ffprobe",
+              "api/util"
+            ]
+          },
+          {
+            "group": "Types",
+            "pages": [
+              "api/progress",
+              "api/errors"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Three ffmpeg execution modes (slim, standard, graceful)",
+    "Async-first with tokio and CancellationToken support",
+    "Progress parsing from ffmpeg output",
+    "ffprobe integration for media metadata",
+    "Tracing instrumentation with valuable support",
+    "Automatic binary discovery with env var overrides"
+  ],
+  "publicApiSurface": [
+    "ffmpeg::ffmpeg_slim",
+    "ffmpeg::ffmpeg",
+    "ffmpeg::ffmpeg_graceful",
+    "ffmpeg::progress::Progress",
+    "ffmpeg::progress::PartialProgress",
+    "ffmpeg::progress::ProgressState",
+    "ffmpeg::FfmpegError",
+    "ffprobe::ffprobe",
+    "ffprobe::FfprobeError",
+    "util::get_duration",
+    "util::DurationError"
+  ]
+}
