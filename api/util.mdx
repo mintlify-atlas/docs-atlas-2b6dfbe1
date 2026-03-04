@@ -69,7 +69,7 @@ The output is parsed as a floating-point number representing seconds, which is t
 ### Example
 
 ```rust
-use libffmpeg::get_duration;
+use libffmpeg::util::get_duration;
 use tokio_util::sync::CancellationToken;
 use std::time::Duration;
 
@@ -84,7 +84,7 @@ println!("Duration in milliseconds: {}", duration.as_millis());
 ### Example with Path Types
 
 ```rust
-use libffmpeg::get_duration;
+use libffmpeg::util::get_duration;
 use tokio_util::sync::CancellationToken;
 use std::path::{Path, PathBuf};
 
@@ -109,7 +109,7 @@ let duration = get_duration(path, token.clone()).await?;
 ### Example with Error Handling
 
 ```rust
-use libffmpeg::{get_duration, DurationError};
+use libffmpeg::util::{get_duration, DurationError};
 use tokio_util::sync::CancellationToken;
 
 let token = CancellationToken::new();
@@ -135,7 +135,7 @@ match get_duration("video.mp4", token).await {
 ### Example with Cancellation
 
 ```rust
-use libffmpeg::get_duration;
+use libffmpeg::util::get_duration;
 use tokio_util::sync::CancellationToken;
 use tokio::time::{timeout, Duration};
 

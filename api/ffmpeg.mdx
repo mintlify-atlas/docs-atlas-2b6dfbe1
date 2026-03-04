@@ -39,7 +39,7 @@ Returns `Result<CommandExit, FfmpegError>`:
 ### Example
 
 ```rust
-use libffmpeg::ffmpeg_slim;
+use libffmpeg::ffmpeg::ffmpeg_slim;
 use tokio_util::sync::CancellationToken;
 
 let token = CancellationToken::new();
@@ -91,7 +91,7 @@ Returns `Result<CommandExit, FfmpegError>`:
 ### Example
 
 ```rust
-use libffmpeg::ffmpeg;
+use libffmpeg::ffmpeg::ffmpeg;
 use libcmd::CommandMonitorServer;
 use tokio_util::sync::CancellationToken;
 
@@ -159,7 +159,7 @@ Returns `Result<CommandExit, FfmpegError>`:
 ### Example
 
 ```rust
-use libffmpeg::ffmpeg_graceful;
+use libffmpeg::ffmpeg::ffmpeg_graceful;
 use libcmd::{CommandMonitorClient, CommandMonitorServer};
 use tokio_util::sync::CancellationToken;
 

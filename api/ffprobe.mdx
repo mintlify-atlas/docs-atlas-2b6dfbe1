@@ -47,7 +47,7 @@ If neither location contains ffprobe, the function returns `FfprobeError::NotFou
 ### Example
 
 ```rust
-use libffmpeg::ffprobe;
+use libffmpeg::ffprobe::ffprobe;
 use tokio_util::sync::CancellationToken;
 
 let token = CancellationToken::new();
@@ -69,7 +69,7 @@ println!("Media info: {}", output);
 #### Get video duration
 
 ```rust
-use libffmpeg::ffprobe;
+use libffmpeg::ffprobe::ffprobe;
 use tokio_util::sync::CancellationToken;
 
 let token = CancellationToken::new();
@@ -88,7 +88,7 @@ let duration = result.stdout_lines.first()
 #### Get stream information
 
 ```rust
-use libffmpeg::ffprobe;
+use libffmpeg::ffprobe::ffprobe;
 use tokio_util::sync::CancellationToken;
 
 let token = CancellationToken::new();
@@ -103,7 +103,7 @@ let result = ffprobe(token, |cmd| {
 #### Get codec information
 
 ```rust
-use libffmpeg::ffprobe;
+use libffmpeg::ffprobe::ffprobe;
 use tokio_util::sync::CancellationToken;
 
 let token = CancellationToken::new();
